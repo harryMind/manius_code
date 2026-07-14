@@ -1,0 +1,20 @@
+[project]
+name = "manius-code"
+version = "0.0.1"
+description = "Local dual-process AI agent foundation"
+requires-python = ">=3.13"
+dependencies = ["pydantic>=2.0"]
+
+[project.scripts]
+manius-core = "manius_code.core.app:main"
+manius = "manius_code.cli.main:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
