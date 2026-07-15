@@ -20,6 +20,12 @@ class LogConfig(BaseModel):
     backup_count: int = Field(default=5, ge=0)
 
 
+class LlmConfig(BaseModel):
+    api_key: str | None = None
+    default_model: str = "claude-sonnet-4-20250514"
+    default_base_url: str | None = None
+
+
 class ManiusConfig(BaseModel):
     # IPC服务基础
     host: str = Field(default="127.0.0.1")
@@ -27,6 +33,8 @@ class ManiusConfig(BaseModel):
     
     # 日志配置
     log: LogConfig = Field(default_factory=LogConfig)
+    llm: LlmConfig = Field(default_factory=LlmConfig)
+    max_steps: int = Field(default=20, ge=1)
 
 
 _CONFIG_KEYS = set(ManiusConfig.model_fields)
@@ -51,11 +59,21 @@ def _read_dotenv(path: Path) -> dict[str, str]:
 # 将带 MANIUS_ 前缀的环境变量映射为内部配置键。
 def _environment_values(values: dict[str, str]) -> dict[str, str]:
     prefix = "MANIUS_"
-    return {
-        key[len(prefix) :].lower(): value
-        for key, value in values.items()
-        if key.upper().startswith(prefix)
-    }
+    mapped: dict[str, object] = {}
+    llm_values: dict[str, str] = {}
+    for key, value in values.items():
+        uppercase_key = key.upper()
+        if uppercase_key == "ANTHROPIC_API_KEY":
+            llm_values["api_key"] = value
+        elif uppercase_key.startswith(prefix):
+            config_key = key[len(prefix) :].lower()
+            if config_key.startswith("llm_"):
+                llm_values[config_key.removeprefix("llm_")] = value
+            else:
+                mapped[config_key] = value
+    if llm_values:
+        mapped["llm"] = llm_values
+    return mapped
 
 
 # 读取 TOML 配置文件，并拒绝未声明的配置键。

@@ -1,0 +1,105 @@
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from pydantic import BaseModel
+
+from manius_code.core.agent.context import ExecutionContext
+from manius_code.core.agent.loop import AgentLoop
+from manius_code.core.config import ManiusConfig
+from manius_code.core.events.bus import EventBus
+from manius_code.core.events.models import RunFinishedEvent, RunStartedEvent
+from manius_code.core.events.subscribers import EventWriter, StdoutPrinter
+from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.tools.read_file import ReadFileTool
+from manius_code.core.tools.registry import ToolRegistry
+
+
+class RunSummary(BaseModel):
+    run_id: str
+    status: str
+    total_steps: int
+    duration_ms: int
+    result: str = ""
+
+
+class AgentRunner:
+    # 注入应用配置、运行目录和可选的 Claude Provider 工厂。
+    def __init__(
+        self,
+        config: ManiusConfig,
+        runs_dir: Path = Path("runs"),
+        provider_factory: Callable[[EventBus, list[dict[str, Any]]], AnthropicProvider] | None = None,
+    ) -> None:
+        self._config = config
+        self._runs_dir = runs_dir
+        self._provider_factory = provider_factory
+
+    # 创建一次运行的依赖并返回其最终汇总信息。
+    async def run(self, goal: str) -> RunSummary:
+        run_id = uuid4().hex
+        run_dir = self._runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        event_bus = EventBus()
+        writer = EventWriter(run_dir / "events.jsonl")
+        event_bus.subscribe(StdoutPrinter().handle)
+        event_bus.subscribe(writer.handle)
+        context = ExecutionContext(run_id=run_id, goal=goal)
+        context.initialize()
+        tools = ToolRegistry()
+        tools.register(ReadFileTool(event_bus, run_id, lambda: context.step))
+        provider = self._make_provider(event_bus, tools)
+        loop = AgentLoop(context, provider, tools, event_bus, self._config.max_steps)
+        started_at = time.monotonic()
+        await event_bus.publish(RunStartedEvent(run_id=run_id, goal=goal, run_dir=str(run_dir)))
+        try:
+            result = await loop.run()
+        except Exception as error:
+            duration_ms = round((time.monotonic() - started_at) * 1000)
+            summary = RunSummary(
+                run_id=run_id,
+                status="failed",
+                total_steps=context.step,
+                duration_ms=duration_ms,
+                result=str(error),
+            )
+            await event_bus.publish(
+                RunFinishedEvent(
+                    run_id=run_id,
+                    step=context.step,
+                    status="failed",
+                    total_steps=context.step,
+                    duration_ms=duration_ms,
+                    summary=str(error),
+                )
+            )
+        else:
+            duration_ms = round((time.monotonic() - started_at) * 1000)
+            summary = RunSummary(
+                run_id=run_id,
+                status="completed",
+                total_steps=context.step,
+                duration_ms=duration_ms,
+                result=result,
+            )
+            await event_bus.publish(
+                RunFinishedEvent(
+                    run_id=run_id,
+                    step=context.step,
+                    status="completed",
+                    total_steps=context.step,
+                    duration_ms=duration_ms,
+                    summary=result,
+                )
+            )
+        finally:
+            writer.close()
+        return summary
+
+    # 按默认 Anthropic 配置或测试工厂构造 Provider。
+    def _make_provider(self, event_bus: EventBus, tools: ToolRegistry) -> AnthropicProvider:
+        if self._provider_factory:
+            return self._provider_factory(event_bus, tools.definitions())
+        return AnthropicProvider(self._config.llm, event_bus, tools.definitions())

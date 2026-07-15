@@ -1,3 +1,7 @@
 .env
 __pycache__/
 *.py[cod]
+runs/
+uv.lock
+.venv/
+.pytest_cache/

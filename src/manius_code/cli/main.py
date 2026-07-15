@@ -1,7 +1,7 @@
 import argparse
 
 import manius_code
-from manius_code.cli.commands import ping,version
+from manius_code.cli.commands import ping, run
 from manius_code.core.config import ConfigError, load_config
 
 
@@ -12,6 +12,7 @@ def _create_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     ping.register(subparsers)
+    run.register(subparsers)
     return parser
 
 
@@ -27,4 +28,7 @@ def main() -> None:
         config = load_config()
     except ConfigError as error:
         parser.exit(1, f"manius: {error}\n")
-    arguments.handler(config)
+    command_arguments = vars(arguments).copy()
+    for name in ("command", "handler", "version"):
+        command_arguments.pop(name, None)
+    arguments.handler(config, **command_arguments)

@@ -8,6 +8,8 @@ there are git branch from stage/s0 to stage/s7, each branch is responsible only 
 
 All package import rules: `from manius_code.包.**`, Install manius_code in editable mode into the virtual environment, and then uniformly start it from the repository root directory, test directory, or script.
 
+If you think there is a lack of fine-grained task details, feel free to ask me questions until you are 95% confident in understanding and executing the task.
+
 ## Commands
 
 ```bash
