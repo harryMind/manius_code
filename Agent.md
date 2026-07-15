@@ -4,7 +4,9 @@ this file provides guidance to codex when working with code in this repository.
 
 ## Precautions
 
-there are git branch from stage/s0 to stage/s7, each branch is responsible only for its corresponding work. Every time a file modification is completed, it needs to be submitted to the temporary storage. Use git revert when there is a bug or a callback is needed. Use 'main' branch as the main branch.
+there are git branch from stage/s0 to stage/s7, each branch is responsible only for its corresponding work. Every time a file modification is completed, it needs to be submitted to the temporary storage. Use git revert when there is a bug or a callback is needed. Use 'main' branch as the main branch. When you are developing a task for a certain stage, the first thing to do is to check whether the git branch matches. If it does not match, Use `git branch ` the command to switch branches.
+
+All package import rules: `from manius_code.包.**`, Install manius_code in editable mode into the virtual environment, and then uniformly start it from the repository root directory, test directory, or script.
 
 ## Commands
 

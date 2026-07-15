@@ -4,8 +4,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from pydantic import ValidationError
 
-from ..bus.commands import PingCommand, PongResult
-from ..bus.envelope import (
+from manius_code.core.bus.commands import PingCommand, PongResult
+from manius_code.core.bus.envelope import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,

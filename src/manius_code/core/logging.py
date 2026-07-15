@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from .config import CoreConfig
+from manius_code.core.config import CoreConfig
 
 
 # 根据当前配置初始化 daemon 日志处理器。

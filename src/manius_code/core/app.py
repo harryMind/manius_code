@@ -3,10 +3,10 @@ import logging
 import signal
 import time
 
-from .bus.commands import PingCommand, PongResult
-from .config import load_config
-from .logging import setup_logging
-from .transport.socket_server import SocketServer
+from manius_code.core.bus.commands import PingCommand, PongResult
+from manius_code.core.config import load_config
+from manius_code.core.logging import setup_logging
+from manius_code.core.transport.socket_server import SocketServer
 
 SERVER_VERSION = "0.0.1"
 logger = logging.getLogger(__name__)
