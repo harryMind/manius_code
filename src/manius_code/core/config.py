@@ -3,21 +3,33 @@ import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
-
+"""
+配置规则：默认值  < TOML配置文件(~/.manius/config.toml)  < ./.env 文件  < 系统环境变量
+后续可添加 CLI参数配置
+"""
 
 class ConfigError(ValueError):
     pass
 
+class LogConfig(BaseModel):
+    level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    format: str = Field(default="text", pattern="^(text|json)$")
+    file: Path | None = None          # None = 输出stdout（终端）
+    file_rotation: bool = True        # 是否开启日志轮转
+    max_size_mb: int = Field(default=10, ge=1)
+    backup_count: int = Field(default=5, ge=0)
 
-class CoreConfig(BaseModel):
-    host: str = "127.0.0.1"
+
+class ManiusConfig(BaseModel):
+    # IPC服务基础
+    host: str = Field(default="127.0.0.1")
     port: int = Field(default=7437, ge=1, le=65535)
-    log_level: str = "INFO"
-    log_file: Path | None = None
-    log_format: str = "text"
+    
+    # 日志配置
+    log: LogConfig = Field(default_factory=LogConfig)
 
 
-_CONFIG_KEYS = set(CoreConfig.model_fields)
+_CONFIG_KEYS = set(ManiusConfig.model_fields)
 
 
 # 读取简单的 KEY=VALUE .env 文件并返回其配置项。
@@ -59,7 +71,7 @@ def _read_toml(path: Path) -> dict[str, object]:
 
 
 # 按默认值、配置文件、.env 和环境变量的优先级加载配置。
-def load_config(cwd: Path | None = None, environ: dict[str, str] | None = None) -> CoreConfig:
+def load_config(cwd: Path | None = None, environ: dict[str, str] | None = None) -> ManiusConfig:
     working_directory = cwd or Path.cwd()
     environment = dict(environ if environ is not None else os.environ)
     configured_path = _environment_values(environment).get("config")
@@ -69,6 +81,6 @@ def load_config(cwd: Path | None = None, environ: dict[str, str] | None = None) 
     merged.update(_environment_values(_read_dotenv(working_directory / ".env")))
     merged.update(_environment_values(environment))
     try:
-        return CoreConfig.model_validate(merged)
+        return ManiusConfig.model_validate(merged)
     except ValidationError as error:
         raise ConfigError(str(error)) from error

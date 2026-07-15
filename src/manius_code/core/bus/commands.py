@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class PingCommand(BaseModel):
     type: Literal["core.ping"] = "core.ping"
+    client: str
 
 
 Command = Annotated[PingCommand, Field(discriminator="type")]

@@ -1,17 +1,32 @@
 import logging
 from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
-from manius_code.core.config import CoreConfig
+from manius_code.core.config import ManiusConfig
 
 
 # 根据当前配置初始化 daemon 日志处理器。
-def setup_logging(config: CoreConfig) -> None:
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if config.log_file:
-        log_path: Path = config.log_file.expanduser()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
-    log_format = "%(asctime)s %(levelname)s %(name)s %(message)s"
-    if config.log_format == "json":
-        log_format = '{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}'
-    logging.basicConfig(level=config.log_level.upper(), format=log_format, handlers=handlers, force=True)
+def setup_logging(cfg: ManiusConfig):
+    root_logger = logging.getLogger()
+    root_logger.setLevel(cfg.log.level)
+
+    if cfg.log.file is None:
+        # 控制台输出
+        handler = logging.StreamHandler()
+    else:
+        path = cfg.log.file.expanduser()
+        path.parent.mkdir(exist_ok=True, parents=True)
+        handler = RotatingFileHandler(
+            path,
+            maxBytes=cfg.log.max_size_mb * 1024 * 1024,
+            backupCount=cfg.log.backup_count,
+            encoding="utf-8"
+        )
+
+    if cfg.log.format == "json":
+        # json格式化处理器
+        pass
+    else:
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+
+    root_logger.addHandler(handler)
