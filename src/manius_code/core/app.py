@@ -2,6 +2,7 @@ import asyncio
 import logging
 import signal
 import time
+from typing import Any
 
 from manius_code.core.bus.commands import PingCommand, PongResult
 from manius_code.core.config import load_config
@@ -18,7 +19,8 @@ class CoreApp:
         self._started_at = time.monotonic()
 
     # 处理 ping 命令并返回 daemon 版本和已运行时间。
-    async def _ping(self, _: PingCommand) -> PongResult:
+    async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
+        PingCommand.model_validate(params)
         uptime_ms = round((time.monotonic() - self._started_at) * 1000)
         return PongResult(server=SERVER_VERSION, uptime_ms=uptime_ms)
 
@@ -27,7 +29,9 @@ class CoreApp:
         config = load_config()
         setup_logging(config)
         server = SocketServer(config.host, config.port)
-        server.register("core.ping", self._ping)
+        # 注册handler
+        server.register("core.ping", self._ping_handler)
+
         await server.start()
         stopped = asyncio.Event()
         loop = asyncio.get_running_loop()

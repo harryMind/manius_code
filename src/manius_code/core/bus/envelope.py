@@ -22,7 +22,7 @@ class JsonRpcRequest(BaseModel):
 class JsonRpcSuccess(BaseModel):
     jsonrpc: Literal["2.0"] = "2.0"
     id: int | str | None
-    result: dict[str, Any]
+    result: Any
 
 
 class JsonRpcErrorBody(BaseModel):

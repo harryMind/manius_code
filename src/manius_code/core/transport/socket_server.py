@@ -2,22 +2,23 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from pydantic import ValidationError
+from typing import Any
 
-from manius_code.core.bus.commands import PingCommand, PongResult
+from pydantic import BaseModel, ValidationError
+
 from manius_code.core.bus.envelope import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
-    JsonRpcRequest,
     JsonRpcError,
+    JsonRpcRequest,
     JsonRpcSuccess,
     make_error,
 )
 
-CommandHandler = Callable[[PingCommand], Awaitable[PongResult]]
+CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
 logger = logging.getLogger(__name__)
 
 
@@ -46,7 +47,7 @@ class SocketServer:
     # 启动 TCP 服务器并开始接受 NDJSON 客户端连接。
     async def start(self) -> None:
         await self._ensure_port_is_available()
-        self._server = await asyncio.start_server(self._handle_client, self._host, self._port)
+        self._server = await asyncio.start_server(self._handle_client, self._host, self._port,limit=64 * 1024 * 1024)
         logger.info("manius-core listening on %s:%s", self._host, self._port)
 
     # 停止接受连接并等待现有服务器关闭。
@@ -57,19 +58,35 @@ class SocketServer:
         await self._server.wait_closed()
         self._server = None
 
-    # 读取客户端 NDJSON 请求并依次返回 JSON-RPC 响应。
+    # 管理单个客户端连接的读取任务和关闭流程。
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            while line := await reader.readline():
-                response = await self._dispatch(line)
-                writer.write(response.model_dump_json().encode() + b"\n")
-                await writer.drain()
+            await self._read_loop(reader, writer)
         finally:
             writer.close()
             await writer.wait_closed()
 
-    # 验证请求、调用对应处理器并转换为协议响应。
-    async def _dispatch(self, line: bytes) -> JsonRpcSuccess | JsonRpcError:
+    # 为每一行请求独立调度分发任务，避免长处理器阻塞读取。
+    async def _read_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        tasks: set[asyncio.Task[None]] = set()
+        while line := await reader.readline():
+            task = asyncio.create_task(self._dispatch(line, writer))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 处理一条请求并将 JSON-RPC 响应发送给客户端。
+    async def _dispatch(self, line: bytes, writer: asyncio.StreamWriter) -> None:
+        try:
+            response = await self._make_response(line)
+            writer.write(response.model_dump_json().encode() + b"\n")
+            await writer.drain()
+        except (ConnectionError, OSError):
+            logger.debug("Client disconnected before receiving a response")
+
+    # 验证请求、调用已注册处理器并封装 JSON-RPC 响应。
+    async def _make_response(self, line: bytes) -> JsonRpcSuccess | JsonRpcError:
         try:
             raw_request = json.loads(line)
         except json.JSONDecodeError:
@@ -83,14 +100,14 @@ class SocketServer:
         if handler is None:
             return make_error(request.id, METHOD_NOT_FOUND, "Method not found")
         try:
-            command = PingCommand.model_validate(request.params)
+            result = await handler(request.params)
         except ValidationError:
             return make_error(request.id, INVALID_PARAMS, "Invalid params")
-        if command.type != request.method:
-            return make_error(request.id, INVALID_PARAMS, "Command type does not match method")
-        try:
-            result = await handler(command)
         except Exception:
             logger.exception("Unhandled command error for %s", request.method)
             return make_error(request.id, INTERNAL_ERROR, "Internal error")
-        return JsonRpcSuccess(id=request.id, result=result.model_dump())
+        return JsonRpcSuccess(id=request.id, result=self._serialize_result(result))
+
+    # 将 Pydantic 返回对象转换为 JSON-RPC 可序列化结果。
+    def _serialize_result(self, result: Any) -> Any:
+        return result.model_dump() if isinstance(result, BaseModel) else result
