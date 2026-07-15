@@ -1,13 +1,16 @@
 import argparse
 
-from manius_code.cli.commands import ping
+import manius_code
+from manius_code.cli.commands import ping,version
 from manius_code.core.config import ConfigError, load_config
 
 
 # 创建 CLI 顶层解析器并注册所有子命令。
 def _create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="manius")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version",help="Print version and exit",action="store_true")
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
     ping.register(subparsers)
     return parser
 
@@ -16,6 +19,10 @@ def _create_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _create_parser()
     arguments = parser.parse_args()
+    # 顶层命令
+    if arguments.version:
+        print(manius_code.__version__)
+        return
     try:
         config = load_config()
     except ConfigError as error:
