@@ -19,10 +19,11 @@ class RunStartedEvent(BaseEvent):
 
 class RunFinishedEvent(BaseEvent):
     type: Literal["run_finished"] = "run_finished"
-    status: Literal["completed", "failed"]
+    status: Literal["success", "failed"]
     total_steps: int
     duration_ms: int
     summary: str = ""
+    reason: str | None = None
 
 
 class StepPlanningEvent(BaseEvent):

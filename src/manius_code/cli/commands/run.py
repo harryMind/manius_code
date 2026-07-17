@@ -17,5 +17,5 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 # 运行 Agent 并以进程状态码表示任务是否成功完成。
 def run(config: ManiusConfig, goal: str) -> None:
     summary = asyncio.run(AgentRunner(config).run(goal))
-    if summary.status != "completed":
+    if summary.status != "success":
         raise SystemExit(1)

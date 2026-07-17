@@ -10,6 +10,23 @@ All package import rules: `from manius_code.包.**`, Install manius_code in edit
 
 If you think there is a lack of fine-grained task details, feel free to ask me questions until you are 95% confident in understanding and executing the task.
 
+After each conversation output, a description statement for the git commit is required.
+### Common types
+1. **fix**: Fix bugs (preferred in your current scenario)
+2. **feat**: New feature
+3. **refactor**: Refactor the code without changing the logic
+4. **docs**: Document modification
+5. **style**: formatting, spacing, line breaks, with no logical changes
+6. **test**: Add/Modify tests
+7. **chore**: miscellaneous tasks related to building, dependencies, and scripts
+For example:
+```bash
+git commit -m "fix: Fixed xxx logic exception"
+git commit -m "fix: resolve error issue in xx module"
+git commit -m "fix: optimize exception handling logic"
+git commit -m "fix: Fixed parameter parsing bug"
+```
+
 ## Commands
 
 ```bash

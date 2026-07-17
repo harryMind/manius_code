@@ -1,7 +1,7 @@
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -20,10 +20,11 @@ from manius_code.core.tools.registry import ToolRegistry
 
 class RunSummary(BaseModel):
     run_id: str
-    status: str
+    status: Literal["success", "failed"]
     total_steps: int
     duration_ms: int
     result: str = ""
+    reason: str | None = None
 
 
 class AgentRunner:
@@ -69,43 +70,49 @@ class AgentRunner:
         started_at = time.monotonic()
         await event_bus.publish(RunStartedEvent(run_id=run_id, goal=goal, run_dir=str(run_dir)))
         try:
-            result = await loop.run()
+            await loop.run()
         except Exception as error:
+            if context.status == "running":
+                context.mark_failed(str(error))
             duration_ms = round((time.monotonic() - started_at) * 1000)
             summary = RunSummary(
                 run_id=run_id,
-                status="failed",
+                status=context.status,
                 total_steps=context.step,
                 duration_ms=duration_ms,
-                result=str(error),
+                result=context.result,
+                reason=context.reason,
             )
             await event_bus.publish(
                 RunFinishedEvent(
                     run_id=run_id,
                     step=context.step,
-                    status="failed",
+                    status=context.status,
                     total_steps=context.step,
                     duration_ms=duration_ms,
-                    summary=str(error),
+                    summary=context.reason or "",
+                    reason=context.reason,
                 )
             )
         else:
             duration_ms = round((time.monotonic() - started_at) * 1000)
             summary = RunSummary(
                 run_id=run_id,
-                status="completed",
+                status=context.status,
                 total_steps=context.step,
                 duration_ms=duration_ms,
-                result=result,
+                result=context.result,
+                reason=context.reason,
             )
             await event_bus.publish(
                 RunFinishedEvent(
                     run_id=run_id,
                     step=context.step,
-                    status="completed",
+                    status=context.status,
                     total_steps=context.step,
                     duration_ms=duration_ms,
-                    summary=result,
+                    summary=context.result,
+                    reason=context.reason,
                 )
             )
         finally:
