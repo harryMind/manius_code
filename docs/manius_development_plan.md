@@ -75,3 +75,58 @@ Output delivery requirements:
 2. Accompanying component dependency description;
 3. Provide an example of the startup test command;
 4. The relevant configurations for LLM have been filled in the .env file
+
+## s2
+
+### Engineering background
+The current project has completed Phase S1: under a single process, 'manius run -- goal' can run an end-to-end Agent loop, including LLM calls, tool execution, event bus, terminal real-time printing, and events.json persistence for the entire chain.
+We are now entering the S2 phase for architecture upgrade: we will migrate AgentRunner to the manius core daemon, convert CLI to a pure client, and remotely schedule tasks and subscribe to event streams through TCP JSON-RPC.
+
+### Reusable assets (interfaces are strictly prohibited from modification and can be reused directly)
+1. Core operating layer: Agentloop, ExecutionContext, ToolInvoke, AnthropicProvider, with completely unchanged interfaces and logic
+2. Event system: All event models (AgentEvent family) EventBus、EventWriter、StdoutPrinter， The interface and rendering logic remain completely unchanged
+3. IPC base: SocketServer, JSON-RPC 2.0 protocol architecture SocketClient， The existing ping interface is available
+4. Persistence: The logic for writing events.json remains unchanged
+
+##Core Objectives of S2 Stage
+1. Make the manius core daemon the only agent execution carrier, and the CLI will no longer directly run AgentRunner
+2. The event bus has added IPC broadcasting capability, and all running events can be pushed to subscription clients through sockets
+3. Change the 'manius run' command of CLI to remote call mode: subscribe to events → initiate tasks → real-time consumption of event stream printing
+4. Support multiple clients to subscribe to the same task event stream simultaneously
+
+### Specific Renovation Task List
+1. Daemon side adds IpcEventBroadcaster component
+-As a subscriber of EventBus, receive all AgentEvents
+-Serialize events into JSON line format and push them to all subscribed client connections through sockets
+-Support concurrent subscriptions from multiple clients, automatic clearing of connection disconnections, and non blocking of event bus main processes
+-The event push format is completely consistent with the existing event model fields, and the client can directly deserialize and reuse the StdoutPrinter
+
+2. Daemon side SocketServer adds RPC method
+-Add 'event. subscribe': After being called by the client, add the current connection to the event broadcast list and continuously push all subsequent running events
+-Add 'agent. run': Receive goal parameter, instantiate AgentRunner and start task, synchronously return task start result
+-All RPC strictly follow the existing JSON-RPC 2.0 protocol specifications and are consistent with the ping interface style
+
+3. Daemon side AgentRunner access
+-Maintain the AgentRunner lifecycle within the daemon process and reuse the S1 complete running link during task execution
+-All events generated during task execution are connected to the local EventBus and distributed to EventWriter (persistence) and IpcEventBroadcaster (remote push) simultaneously
+
+4. CLI side run command transformation
+-Remove the logic of directly instantiating AgentRunner
+-Establish a socket connection to the daemon and perform the following steps in sequence:
+1. Call 'event. subscribe' RPC to subscribe to the event stream
+2. The backend starts the coroutine to continuously read socket push events, deserializes them, and feeds them to the StdoudPrinter for real-time printing
+3. Call 'agent. run' RPC to initiate the task
+-After the task is completed and the event stream push is finished, clear the connection and exit
+
+### Strict constraints
+1. It is prohibited to modify the external interfaces of S1's existing core modules, including but not limited to Agentloop, ExecutionContext, event model, etc EventBus、StdoutPrinter、ToolInvoker
+2. All newly added logic must not disrupt the single process running capability of S1, and the local direct running mode remains optional
+3. The event push protocol is completely aligned with the local event model fields, and the client can reuse the StdoutPrinter without adding parsing logic
+4. IPC broadcasting must not block the main process of the event bus. Abnormal connections must be gracefully downgraded without affecting local task execution and persistence
+
+### Delivery requirements
+1. Output the complete IpcEventBroadcaster implementation code
+2. Output the processing logic for adding two RPC methods to SocketServer
+3. Output the complete entry code modified with the CLI run command
+4. Explain the responsibilities of each newly added code and its calling relationship with existing modules
+5. Verification criteria: After starting the daemon, the CLI can execute 'manius run -- goal' to trigger tasks normally, the terminal can print events in real time, and events.json can be written normally, which is consistent with the single process effect of S1

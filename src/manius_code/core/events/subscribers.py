@@ -93,7 +93,7 @@ class EventWriter:
 
     # 将单个事件追加为一行 JSON 并立即刷新。
     def handle(self, event: AgentEvent) -> None:
-        self._file.write(event.model_dump_json() + "n")
+        self._file.write(event.model_dump_json() + "\n")
         self._file.flush()
 
     # 关闭事件文件句柄。
