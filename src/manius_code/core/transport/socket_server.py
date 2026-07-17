@@ -1,5 +1,6 @@
 import asyncio
 import json
+import inspect
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -19,6 +20,8 @@ from manius_code.core.bus.envelope import (
 )
 
 CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+ConnectionHandler = Callable[[dict[str, Any], asyncio.StreamWriter], Awaitable[Any]]
+DisconnectHandler = Callable[[asyncio.StreamWriter], Awaitable[None] | None]
 logger = logging.getLogger(__name__)
 
 
@@ -29,10 +32,20 @@ class SocketServer:
         self._port = port
         self._server: asyncio.AbstractServer | None = None
         self._handlers: dict[str, CommandHandler] = {}
+        self._connection_handlers: dict[str, ConnectionHandler] = {}
+        self._disconnect_handlers: list[DisconnectHandler] = []
 
     # 为指定 JSON-RPC 方法注册异步命令处理器。
     def register(self, method: str, handler: CommandHandler) -> None:
         self._handlers[method] = handler
+
+    # 为需要当前客户端连接的 JSON-RPC 方法注册处理器。
+    def register_connection_handler(self, method: str, handler: ConnectionHandler) -> None:
+        self._connection_handlers[method] = handler
+
+    # 添加客户端连接关闭时需要执行的清理处理器。
+    def add_disconnect_handler(self, handler: DisconnectHandler) -> None:
+        self._disconnect_handlers.append(handler)
 
     # 确认目标地址没有被已有 daemon 占用。
     async def _ensure_port_is_available(self) -> None:
@@ -63,6 +76,7 @@ class SocketServer:
         try:
             await self._read_loop(reader, writer)
         finally:
+            await self._notify_disconnect(writer)
             writer.close()
             await writer.wait_closed()
 
@@ -79,14 +93,14 @@ class SocketServer:
     # 处理一条请求并将 JSON-RPC 响应发送给客户端。
     async def _dispatch(self, line: bytes, writer: asyncio.StreamWriter) -> None:
         try:
-            response = await self._make_response(line)
+            response = await self._make_response(line, writer)
             writer.write(response.model_dump_json().encode() + b"\n")
             await writer.drain()
         except (ConnectionError, OSError):
             logger.debug("Client disconnected before receiving a response")
 
     # 验证请求、调用已注册处理器并封装 JSON-RPC 响应。
-    async def _make_response(self, line: bytes) -> JsonRpcSuccess | JsonRpcError:
+    async def _make_response(self, line: bytes, writer: asyncio.StreamWriter) -> JsonRpcSuccess | JsonRpcError:
         try:
             raw_request = json.loads(line)
         except json.JSONDecodeError:
@@ -97,16 +111,27 @@ class SocketServer:
             request_id = raw_request.get("id") if isinstance(raw_request, dict) else None
             return make_error(request_id, INVALID_REQUEST, "Invalid Request")
         handler = self._handlers.get(request.method)
-        if handler is None:
+        connection_handler = self._connection_handlers.get(request.method)
+        if handler is None and connection_handler is None:
             return make_error(request.id, METHOD_NOT_FOUND, "Method not found")
         try:
-            result = await handler(request.params)
+            result = await connection_handler(request.params, writer) if connection_handler else await handler(request.params)
         except ValidationError:
             return make_error(request.id, INVALID_PARAMS, "Invalid params")
         except Exception:
             logger.exception("Unhandled command error for %s", request.method)
             return make_error(request.id, INTERNAL_ERROR, "Internal error")
         return JsonRpcSuccess(id=request.id, result=self._serialize_result(result))
+
+    # 依次通知连接关闭处理器并忽略清理过程中的异常。
+    async def _notify_disconnect(self, writer: asyncio.StreamWriter) -> None:
+        for handler in self._disconnect_handlers:
+            try:
+                result = handler(writer)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.exception("Unhandled client disconnect handler error")
 
     # 将 Pydantic 返回对象转换为 JSON-RPC 可序列化结果。
     def _serialize_result(self, result: Any) -> Any:

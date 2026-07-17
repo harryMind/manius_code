@@ -8,9 +8,26 @@ class PingCommand(BaseModel):
     client: str
 
 
-Command = Annotated[PingCommand, Field(discriminator="type")]
+class EventSubscribeCommand(BaseModel):
+    type: Literal["event.subscribe"] = "event.subscribe"
+
+
+class AgentRunCommand(BaseModel):
+    type: Literal["agent.run"] = "agent.run"
+    goal: str = Field(min_length=1)
+
+
+Command = Annotated[PingCommand | EventSubscribeCommand | AgentRunCommand, Field(discriminator="type")]
 
 
 class PongResult(BaseModel):
     server: str
     uptime_ms: int
+
+
+class EventSubscribeResult(BaseModel):
+    subscribed: bool = True
+
+
+class AgentRunResult(BaseModel):
+    run_id: str
