@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import LlmRequestEvent, LlmResponseEvent
+from manius_code.core.events.models import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
 
 
 class ToolCall(BaseModel):
@@ -34,7 +34,7 @@ class AnthropicProvider:
         client = self._client or self._create_client()
         self._client = client
         started_at = time.monotonic()
-        response = await client.messages.create(
+        async with client.messages.stream(
             model=self._config.default_model,
             max_tokens=4096,
             system="""
@@ -45,7 +45,10 @@ class AnthropicProvider:
             """,
             messages=messages,
             tools=self._tool_definitions,
-        )
+        ) as stream:
+            async for token in stream.text_stream:
+                await self._event_bus.publish(LlmTokenEvent(run_id=run_id, step=step, token=token))
+            response = await stream.get_final_message()
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         assistant_content: list[dict[str, Any]] = []

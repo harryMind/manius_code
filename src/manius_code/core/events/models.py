@@ -62,6 +62,11 @@ class LlmRequestEvent(BaseEvent):
     messages: list[dict[str, Any]]
 
 
+class LlmTokenEvent(BaseEvent):
+    type: Literal["llm_token"] = "llm_token"
+    token: str
+
+
 class LlmResponseEvent(BaseEvent):
     type: Literal["llm_response"] = "llm_response"
     duration_ms: int
@@ -78,6 +83,7 @@ AgentEvent = Annotated[
     | ToolCallSuccessEvent
     | ToolCallFailedEvent
     | LlmRequestEvent
+    | LlmTokenEvent
     | LlmResponseEvent,
     Field(discriminator="type"),
 ]

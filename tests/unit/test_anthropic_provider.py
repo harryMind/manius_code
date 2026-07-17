@@ -1,11 +1,14 @@
 import asyncio
+from collections.abc import AsyncIterator
+from io import StringIO
 from typing import Any
 
 from pydantic import BaseModel
 
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import AgentEvent
+from manius_code.core.events.models import AgentEvent, LlmTokenEvent
+from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
 
 
@@ -21,19 +24,45 @@ class FakeResponse(BaseModel):
     content: list[FakeBlock]
 
 
+class FakeStream:
+    # 模拟 SDK 流式上下文管理器并依次提供文本片段。
+    def __init__(self, response: FakeResponse) -> None:
+        self._response = response
+        self.text_stream = self._tokens()
+
+    # 进入模拟流式上下文。
+    async def __aenter__(self) -> "FakeStream":
+        return self
+
+    # 退出模拟流式上下文。
+    async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        return None
+
+    # 逐段生成模型文本以模拟 token 到达。
+    async def _tokens(self) -> AsyncIterator[str]:
+        yield "I will "
+        yield "read the file."
+
+    # 返回流结束后的完整消息供工具调用解析。
+    async def get_final_message(self) -> FakeResponse:
+        return self._response
+
+
 class FakeMessages:
     # 保存请求参数并返回确定性的 Claude 内容块。
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
 
-    # 模拟 Anthropic messages.create 的异步响应。
-    async def create(self, **kwargs: Any) -> FakeResponse:
+    # 模拟 Anthropic messages.stream 并保存请求参数。
+    def stream(self, **kwargs: Any) -> FakeStream:
         self.request = kwargs
-        return FakeResponse(
-            content=[
-                FakeBlock(type="text", text="I will read the file."),
-                FakeBlock(type="tool_use", id="tool-1", name="read_file", input={"path": "README.md"}),
-            ]
+        return FakeStream(
+            FakeResponse(
+                content=[
+                    FakeBlock(type="text", text="I will read the file."),
+                    FakeBlock(type="tool_use", id="tool-1", name="read_file", input={"path": "README.md"}),
+                ]
+            )
         )
 
 
@@ -60,5 +89,16 @@ def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
     assert client.messages.request["model"] == "test-model"
     assert response.tool_calls[0].name == "read_file"
     assert events[0].type == "llm_request"
-    assert events[1].type == "llm_response"
-    assert events[1].duration_ms >= 0
+    assert [event.token for event in events if event.type == "llm_token"] == ["I will ", "read the file."]
+    assert events[-1].type == "llm_response"
+    assert events[-1].duration_ms >= 0
+
+
+# 功能：验证终端订阅器收到 token 事件后立即原样输出且不追加换行。
+# 设计：使用内存文本流观察精确输出，避免依赖真实终端缓冲策略。
+def test_stdout_printer_writes_each_llm_token_without_newline() -> None:
+    stream = StringIO()
+    printer = StdoutPrinter(stream)
+    printer.handle(LlmTokenEvent(run_id="run-1", step=1, token="streamed text"))
+
+    assert stream.getvalue() == "streamed text"

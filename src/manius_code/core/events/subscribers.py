@@ -12,12 +12,15 @@ class StdoutPrinter:
 
     # 将关键 Agent 事件渲染为终端中的单行状态日志。
     def handle(self, event: AgentEvent) -> None:
+        if event.type == "llm_token":
+            print(event.token, end="", file=self._stream, flush=True)
+            return
         if event.type == "run_started":
             message = f"run {event.run_id} started: {event.goal}"
         elif event.type == "step_planning":
             message = f"step {event.step} planning: {event.plan}"
         elif event.type == "llm_response":
-            message = f"step {event.step} thinking: {event.text}"
+            message = ""
         elif event.type == "tool_call_start":
             message = f"step {event.step} tool start: {event.tool_name}"
         elif event.type == "tool_call_success":
