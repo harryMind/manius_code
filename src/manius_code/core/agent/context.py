@@ -2,7 +2,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-
+# s1阶段仅保留 AgentLoop 运行必需最小字段
 class ExecutionContext(BaseModel):
     run_id: str
     goal: str

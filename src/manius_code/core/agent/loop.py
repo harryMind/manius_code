@@ -2,7 +2,7 @@ from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.events.bus import EventBus
 from manius_code.core.events.models import StepDoneEvent, StepPlanningEvent
 from manius_code.core.llm.anthropic import AnthropicProvider
-from manius_code.core.tools.registry import ToolRegistry
+from manius_code.core.tools.invocation import ToolInvoker
 
 
 class AgentLoop:
@@ -11,13 +11,13 @@ class AgentLoop:
         self,
         context: ExecutionContext,
         provider: AnthropicProvider,
-        tools: ToolRegistry,
+        tool_invoker: ToolInvoker,
         event_bus: EventBus,
         max_steps: int,
     ) -> None:
         self._context = context
         self._provider = provider
-        self._tools = tools
+        self._tool_invoker = tool_invoker
         self._event_bus = event_bus
         self._max_steps = max_steps
 
@@ -49,7 +49,7 @@ class AgentLoop:
                 )
                 return response.text
             for tool_call in response.tool_calls:
-                result = await self._tools.get(tool_call.name).execute(tool_call.arguments)
+                result = await self._tool_invoker.invoke(tool_call.name, tool_call.arguments)
                 self._context.add_tool_result(tool_call.id, result)
             await self._event_bus.publish(
                 StepDoneEvent(

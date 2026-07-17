@@ -50,7 +50,8 @@ After running, two types of outputs will be achieved:
  Encapsulate LLM API calls; receive conversation context, initiate requests, and return structured responses; push events throughout the entire LLM interaction process.
 6. Tool system
  ToolRegistry: Unified tool registration and retrieval;
- ReadFileTool: The only implementation tool, which reads local text files; broadcasts events before and after tool execution, and calculates execution time.
+ ReadFileTool: The only implementation tool, which reads local text files; 
+ Specific tools Architecture: Each tool should have error messages that correspond to the execution errors of the tool. Furthermore, the specific execution of the tool needs to be decoupled from the broadcast event. Only the unified interface for tool invocation, wrapped by the broadcast event, should be exposed externally;
 7. Event observation system (based on EventBus publish-subscribe)
  EventBus: Global Broadcast Center;
  StdoutPrinter: Subscribe to events and format output for human-readable terminal logs;

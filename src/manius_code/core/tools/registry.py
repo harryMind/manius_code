@@ -6,7 +6,7 @@ class Tool(Protocol):
     name: str
     definition: dict[str, Any]
 
-    # 执行工具并返回可写入对话上下文的文本结果。
+    # 执行具体工具逻辑并返回可写入上下文的文本结果。
     def execute(self, arguments: dict[str, Any]) -> Awaitable[str]: ...
 
 
@@ -15,16 +15,16 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
 
-    # 使用工具名称注册一个可执行工具。
+    # 使用工具名称注册一个仅负责具体执行的工具。
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
-    # 根据名称取得已注册工具，不存在时抛出清晰错误。
+    # 根据名称查看已注册工具，不存在时抛出查询错误。
     def get(self, name: str) -> Tool:
         try:
             return self._tools[name]
         except KeyError as error:
-            raise ValueError(f"Unknown tool: {name}") from error
+            raise KeyError(f"Tool is not registered: {name}") from error
 
     # 返回可传递给 Anthropic API 的工具定义列表。
     def definitions(self) -> list[dict[str, Any]]:

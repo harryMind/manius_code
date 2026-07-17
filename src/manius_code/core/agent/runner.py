@@ -13,6 +13,7 @@ from manius_code.core.events.bus import EventBus
 from manius_code.core.events.models import RunFinishedEvent, RunStartedEvent
 from manius_code.core.events.subscribers import EventWriter, StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.tools.invocation import ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
 from manius_code.core.tools.registry import ToolRegistry
 
@@ -39,19 +40,32 @@ class AgentRunner:
 
     # 创建一次运行的依赖并返回其最终汇总信息。
     async def run(self, goal: str) -> RunSummary:
+        # 任务ID
         run_id = uuid4().hex
         run_dir = self._runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
+
+        # 全局事件总线
         event_bus = EventBus()
         writer = EventWriter(run_dir / "events.jsonl")
         event_bus.subscribe(StdoutPrinter().handle)
         event_bus.subscribe(writer.handle)
+
+        # 全局状态容器
         context = ExecutionContext(run_id=run_id, goal=goal)
         context.initialize()
+
+        # 注册工具
         tools = ToolRegistry()
-        tools.register(ReadFileTool(event_bus, run_id, lambda: context.step))
+        # s1 仅读取文件工具
+        tools.register(ReadFileTool())
+        tool_invoker = ToolInvoker(tools, event_bus, run_id, lambda: context.step)
+
+        # llm绑定事件总线与工具注册表
         provider = self._make_provider(event_bus, tools)
-        loop = AgentLoop(context, provider, tools, event_bus, self._config.max_steps)
+
+        # 智能体核心主循环（Plan → Act → Observe）
+        loop = AgentLoop(context, provider, tool_invoker, event_bus, self._config.max_steps)
         started_at = time.monotonic()
         await event_bus.publish(RunStartedEvent(run_id=run_id, goal=goal, run_dir=str(run_dir)))
         try:

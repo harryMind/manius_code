@@ -1,12 +1,9 @@
-import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import ToolCallFailedEvent, ToolCallStartEvent, ToolCallSuccessEvent
+from manius_code.core.tools.invocation import ToolExecutionError
 
 
 class ReadFileArguments(BaseModel):
@@ -25,42 +22,21 @@ class ReadFileTool:
         },
     }
 
-    # 注入事件总线和当前运行元数据。
-    def __init__(self, event_bus: EventBus, run_id: str, step_getter: Callable[[], int]) -> None:
-        self._event_bus = event_bus
-        self._run_id = run_id
-        self._step_getter = step_getter
-
-    # 读取文本文件，并以事件记录调用结果和耗时。
+    # 读取 UTF-8 文本文件并转换底层异常为工具错误。
     async def execute(self, arguments: dict[str, Any]) -> str:
-        parsed = ReadFileArguments.model_validate(arguments)
-        step = self._step_getter()
-        await self._event_bus.publish(
-            ToolCallStartEvent(run_id=self._run_id, step=step, tool_name=self.name, arguments=arguments)
-        )
-        started_at = time.monotonic()
         try:
-            result = Path(parsed.path).read_text(encoding="utf-8")
-        except Exception as error:
-            duration_ms = round((time.monotonic() - started_at) * 1000)
-            await self._event_bus.publish(
-                ToolCallFailedEvent(
-                    run_id=self._run_id,
-                    step=step,
-                    tool_name=self.name,
-                    duration_ms=duration_ms,
-                    error=str(error),
-                )
-            )
-            raise
-        duration_ms = round((time.monotonic() - started_at) * 1000)
-        await self._event_bus.publish(
-            ToolCallSuccessEvent(
-                run_id=self._run_id,
-                step=step,
-                tool_name=self.name,
-                duration_ms=duration_ms,
-                result=result,
-            )
-        )
-        return result
+            path = Path(ReadFileArguments.model_validate(arguments).path)
+        except ValidationError as error:
+            raise ToolExecutionError(self.name, "requires a valid 'path' string") from error
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError as error:
+            raise ToolExecutionError(self.name, f"file not found: {path}") from error
+        except IsADirectoryError as error:
+            raise ToolExecutionError(self.name, f"path is a directory, not a text file: {path}") from error
+        except PermissionError as error:
+            raise ToolExecutionError(self.name, f"permission denied: {path}") from error
+        except UnicodeDecodeError as error:
+            raise ToolExecutionError(self.name, f"file is not valid UTF-8 text: {path}") from error
+        except OSError as error:
+            raise ToolExecutionError(self.name, f"could not read file {path}: {error}") from error
