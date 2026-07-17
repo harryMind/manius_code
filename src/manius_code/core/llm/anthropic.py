@@ -37,7 +37,12 @@ class AnthropicProvider:
         response = await client.messages.create(
             model=self._config.default_model,
             max_tokens=4096,
-            system="You are a local file-analysis Agent. Use read_file when you need file contents. Complete the task after observing tool results.",
+            system="""
+                        "You are a helpful AI assistant. "
+                        "Use the available tools to complete the user's goal. "
+                        "When the goal is fully achieved, respond with a final answer "
+                        "and do not call any more tools."
+            """,
             messages=messages,
             tools=self._tool_definitions,
         )
