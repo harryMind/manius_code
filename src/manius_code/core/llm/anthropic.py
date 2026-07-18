@@ -45,6 +45,7 @@ class AnthropicProvider:
             """,
             messages=messages,
             tools=self._tool_definitions,
+            cache_control={"type": "ephemeral"}
         ) as stream:
             async for token in stream.text_stream:
                 await self._event_bus.publish(LlmTokenEvent(run_id=run_id, step=step, token=token))
