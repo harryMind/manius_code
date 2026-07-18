@@ -1,0 +1,72 @@
+import asyncio
+from typing import Any
+
+from manius_code.core.bus.events import LlmTokenEvent, RunFinishedEvent, RunStartedEvent, StepPlanningEvent
+from manius_code.core.config import ManiusConfig
+from manius_code.core.events.ipc import IpcEventBroadcaster
+from manius_code.core.transport.socket_server import SocketServer
+from manius_code.tui.app import ManiusTui
+from textual.widgets import RichLog
+
+
+# 功能：验证 TUI 将事件按 run_id 和状态生成带语义标签的富文本。
+# 设计：直接调用纯格式化逻辑，不依赖终端驱动即可覆盖多任务区分和成功完成样式。
+def test_tui_formats_events_with_run_id_and_status() -> None:
+    app = ManiusTui(ManiusConfig())
+    started = app._format_event(RunStartedEvent(run_id="run-a", goal="inspect README", run_dir="runs/run-a"))
+    finished = app._format_event(
+        RunFinishedEvent(run_id="run-b", status="success", total_steps=1, duration_ms=42, summary="done")
+    )
+
+    assert started.plain == "[run-a] RUN inspect README"
+    assert finished.plain == "[run-b] FINISHED 42ms"
+
+
+# 功能：验证 LLM token 只在后续非 token 事件到达时批量写入日志。
+# 设计：使用 Textual 测试驱动挂载真实 RichLog，断言 token 阶段无写入且刷新后缓冲被清空。
+def test_tui_buffers_tokens_until_a_non_token_event_arrives() -> None:
+    # 驱动挂载后的 TUI 接收 token 与普通事件。
+    async def exercise() -> None:
+        app = ManiusTui(ManiusConfig(port=1))
+        async with app.run_test():
+            log = app.query_one("#event-log", RichLog)
+            initial_lines = len(log.lines)
+            await app.handle_event(LlmTokenEvent(run_id="run-a", token="hello").model_dump(mode="json"))
+            assert app._token_buffer == "hello"
+            assert len(log.lines) == initial_lines
+            await app.handle_event(StepPlanningEvent(run_id="run-a", step=1, plan="continue").model_dump(mode="json"))
+            assert app._token_buffer == ""
+            assert len(log.lines) >= initial_lines + 2
+
+    asyncio.run(exercise())
+
+
+# 功能：验证 TUI Worker 通过既有 SocketClient 订阅全局事件并渲染服务端推送。
+# 设计：启动真实 SocketServer 和 IpcEventBroadcaster，覆盖连接、订阅、event.push 解包和 RichLog 写入链路。
+def test_tui_worker_subscribes_and_consumes_global_events(free_port: int) -> None:
+    # 驱动 daemon 与 Textual 应用完成一次全局事件推送。
+    async def exercise() -> None:
+        broadcaster = IpcEventBroadcaster()
+        subscribed = asyncio.Event()
+        server = SocketServer("127.0.0.1", free_port)
+
+        # 为测试服务器注册与生产一致的全局订阅处理器。
+        async def subscribe(params: dict[str, Any], writer: asyncio.StreamWriter) -> dict[str, Any]:
+            assert params == {"type": "event.subscribe", "run_id": None, "topics": ["*"]}
+            subscribed.set()
+            return {"subscribed": True, "sub_id": broadcaster.subscribe(writer, None, ["*"]), "run_id": None, "topics": ["*"]}
+
+        server.register_connection_handler("event.subscribe", subscribe)
+        server.add_disconnect_handler(broadcaster.unsubscribe_writer)
+        await server.start()
+        app = ManiusTui(ManiusConfig(port=free_port))
+        try:
+            async with app.run_test() as pilot:
+                await asyncio.wait_for(subscribed.wait(), timeout=1)
+                broadcaster.handle(RunStartedEvent(run_id="run-a", goal="inspect README", run_dir="runs/run-a"))
+                await pilot.pause()
+                assert len(app.query_one("#event-log", RichLog).lines) > 0
+        finally:
+            await server.stop()
+
+    asyncio.run(exercise())
