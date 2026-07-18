@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import AgentEvent, LlmTokenEvent
+from manius_code.core.bus.events import AgentEvent, LlmTokenEvent
 from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
 

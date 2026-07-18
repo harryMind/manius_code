@@ -5,7 +5,7 @@ from manius_code.cli.commands.run import _run_remote
 from manius_code.core.bus.commands import AgentRunResult
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.ipc import IpcEventBroadcaster
-from manius_code.core.events.models import RunFinishedEvent, RunStartedEvent
+from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.transport.socket_server import SocketServer
 
 

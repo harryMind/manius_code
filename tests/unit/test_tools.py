@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import AgentEvent
+from manius_code.core.bus.events import AgentEvent
 from manius_code.core.tools.invocation import ToolExecutionError, ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
 from manius_code.core.tools.registry import ToolRegistry

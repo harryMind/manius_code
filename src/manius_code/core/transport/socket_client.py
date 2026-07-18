@@ -94,6 +94,9 @@ class SocketClient:
             raise IpcError(-32700, "Received invalid JSON") from error
         if not isinstance(message, dict):
             raise IpcError(-32600, "Received invalid JSON-RPC message")
+        if message.get("kind") == "event":
+            await self.on_event(message)
+            return
         request_id = message.get("id")
         if isinstance(request_id, str) and request_id in self._pending:
             future = self._pending[request_id]
@@ -108,9 +111,6 @@ class SocketClient:
                 future.set_exception(IpcError(error.code, error.message))
             else:
                 future.set_result(response)
-            return
-        if "method" in message:
-            await self.on_event(message)
             return
         logger.warning("Ignoring JSON-RPC message with unknown request ID: %r", request_id)
 

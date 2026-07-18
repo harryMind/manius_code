@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
-from manius_code.core.events.models import AgentEvent
+from manius_code.core.bus.events import AgentEvent
 
 
 # 将关键 Agent 事件渲染为美观、分层、带颜色标识的终端实时日志

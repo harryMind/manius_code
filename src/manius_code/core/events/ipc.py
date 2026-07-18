@@ -1,8 +1,7 @@
 import asyncio
-import json
 import logging
 
-from manius_code.core.events.models import AgentEvent
+from manius_code.core.bus.events import AgentEvent
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +28,10 @@ class IpcEventBroadcaster:
             task.add_done_callback(self._tasks.discard)
 
     # 将事件封装为 JSON-RPC 通知并写入指定连接。
+    # 将带 kind 字段的事件模型序列化为 NDJSON 并写入指定连接。
     async def _send(self, writer: asyncio.StreamWriter, event: AgentEvent) -> None:
-        message = {"jsonrpc": "2.0", "method": "event.push", "params": event.model_dump(mode="json")}
         try:
-            writer.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+            writer.write(event.model_dump_json().encode() + b"\n")
             await writer.drain()
         except (ConnectionError, OSError, RuntimeError):
             logger.debug("Removing disconnected event subscriber")

@@ -1,7 +1,7 @@
 import inspect
 from collections.abc import Awaitable, Callable
 
-from manius_code.core.events.models import AgentEvent
+from manius_code.core.bus.events import AgentEvent
 
 Subscriber = Callable[[AgentEvent], Awaitable[None] | None]
 

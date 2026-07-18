@@ -2,7 +2,7 @@ import asyncio
 from typing import Any
 
 from manius_code.core.events.ipc import IpcEventBroadcaster
-from manius_code.core.events.models import RunStartedEvent
+from manius_code.core.bus.events import RunStartedEvent
 from manius_code.core.transport.socket_client import SocketClient
 from manius_code.core.transport.socket_server import SocketServer
 
@@ -45,14 +45,14 @@ def test_ipc_event_broadcaster_pushes_to_multiple_subscribers_and_cleans_disconn
 
             broadcaster.handle(RunStartedEvent(run_id="run-1", goal="goal", run_dir="runs/run-1"))
             first_event, second_event = await asyncio.gather(first.events.get(), second.events.get())
-            assert first_event["method"] == "event.push"
-            assert second_event["params"]["run_id"] == "run-1"
+            assert first_event["kind"] == "event"
+            assert second_event["run_id"] == "run-1"
 
             await first.close()
             await asyncio.sleep(0)
             broadcaster.handle(RunStartedEvent(run_id="run-2", goal="goal", run_dir="runs/run-2"))
             remaining_event = await asyncio.wait_for(second.events.get(), timeout=1)
-            assert remaining_event["params"]["run_id"] == "run-2"
+            assert remaining_event["run_id"] == "run-2"
             assert len(broadcaster._writers) == 1
         finally:
             await first.close()

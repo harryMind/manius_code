@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
+from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
 
 
 class ToolCall(BaseModel):

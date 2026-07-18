@@ -8,7 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from manius_code.core.bus.commands import AgentRunResult
 from manius_code.core.config import ManiusConfig
-from manius_code.core.events.models import AgentEvent, RunFinishedEvent
+from manius_code.core.bus.events import AgentEvent, RunFinishedEvent
 from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.transport.socket_client import SocketClient
 
@@ -31,10 +31,8 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
 
     # 渲染服务端事件，并记录已结束的远程运行。 处理服务端推送的event
     async def handle_event(message: dict[str, Any]) -> None:
-        if message.get("method") != "event.push" or not isinstance(message.get("params"), dict):
-            return
         try:
-            event = _EVENT_ADAPTER.validate_python(message["params"])
+            event = _EVENT_ADAPTER.validate_python(message)
         except ValidationError:
             return
         printer.handle(event)
