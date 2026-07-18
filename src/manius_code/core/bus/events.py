@@ -95,6 +95,12 @@ AgentEvent = Annotated[
     Field(discriminator="type"),
 ]
 
+
+class EventPushEnvelope(BaseModel):
+    jsonrpc: Literal["2.0"] = "2.0"
+    method: Literal["event.push"] = "event.push"
+    params: AgentEvent
+
 Event = Annotated[
     CoreStartedEvent
     | RunStartedEvent

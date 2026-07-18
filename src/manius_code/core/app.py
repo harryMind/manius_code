@@ -1,14 +1,19 @@
 import asyncio
+import json
 import logging
 import signal
 import time
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.bus.commands import AgentRunCommand, AgentRunResult, EventSubscribeCommand, EventSubscribeResult, PingCommand, PongResult
+from manius_code.core.bus.commands import AgentRunCommand, AgentRunResult, EventListCommand, EventListResult, EventSubscribeCommand, EventSubscribeResult, EventUnsubscribeCommand, EventUnsubscribeResult, PingCommand, PongResult
+from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.config import ManiusConfig, load_config
+from manius_code.core.events.bus import EventBus
 from manius_code.core.events.ipc import IpcEventBroadcaster
+from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.logging import setup_logging
 from manius_code.core.transport.socket_server import SocketServer
 
@@ -23,6 +28,7 @@ class CoreApp:
         self._config: ManiusConfig | None = None
         self._event_broadcaster = IpcEventBroadcaster()
         self._agent_tasks: set[asyncio.Task[Any]] = set()
+        self._runs_dir = Path("runs")
 
     # 处理 ping 命令并返回 daemon 版本和已运行时间。
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -32,21 +38,64 @@ class CoreApp:
 
     # 订阅当前客户端连接以接收后续 Agent 事件通知。
     async def _event_subscribe_handler(self, params: dict[str, Any], writer: asyncio.StreamWriter) -> EventSubscribeResult:
-        EventSubscribeCommand.model_validate(params)
-        self._event_broadcaster.subscribe(writer)
-        return EventSubscribeResult()
+        command = EventSubscribeCommand.model_validate(params)
+        sub_id = self._event_broadcaster.subscribe(writer, command.run_id, command.topics)
+        return EventSubscribeResult(sub_id=sub_id, run_id=command.run_id, topics=command.topics)
+
+    # 按订阅标识取消当前客户端已有的事件订阅。
+    async def _event_unsubscribe_handler(self, params: dict[str, Any]) -> EventUnsubscribeResult:
+        command = EventUnsubscribeCommand.model_validate(params)
+        return EventUnsubscribeResult(unsubscribed=self._event_broadcaster.unsubscribe(command.sub_id))
+
+    # 从指定运行的 JSONL 文件读取持久化事件用于断线重连回放。
+    async def _event_list_handler(self, params: dict[str, Any]) -> EventListResult:
+        command = EventListCommand.model_validate(params)
+        event_path = self._runs_dir / command.run_id / "events.jsonl"
+        if not event_path.is_file():
+            return EventListResult(run_id=command.run_id, events=[])
+        events = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
+        return EventListResult(run_id=command.run_id, events=events)
 
     # 创建后台 Agent 任务并立即返回其可追踪的运行标识。
     async def _agent_run_handler(self, params: dict[str, Any]) -> AgentRunResult:
         if self._config is None:
             raise RuntimeError("CoreApp configuration is not initialized")
-        command = AgentRunCommand.model_validate(params)
         run_id = uuid4().hex
-        runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle])
-        task = asyncio.create_task(runner.run(command.goal, run_id))
+        try:
+            command = AgentRunCommand.model_validate(params)
+            if not command.goal.strip():
+                raise ValueError("goal must not be blank")
+        except (ValueError, TypeError) as error:
+            task = asyncio.create_task(self._publish_failed_run(run_id, str(error)))
+        else:
+            runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle])
+            task = asyncio.create_task(runner.run(command.goal, run_id))
         self._agent_tasks.add(task)
         task.add_done_callback(self._record_agent_task_result)
         return AgentRunResult(run_id=run_id)
+
+    # 为参数校验失败的远程任务持久化并广播完整的失败事件闭环。
+    async def _publish_failed_run(self, run_id: str, reason: str) -> None:
+        run_dir = self._runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        writer = EventWriter(run_dir / "events.jsonl")
+        event_bus = EventBus()
+        event_bus.subscribe(writer.handle)
+        event_bus.subscribe(self._event_broadcaster.handle)
+        try:
+            await event_bus.publish(RunStartedEvent(run_id=run_id, goal="", run_dir=str(run_dir)))
+            await event_bus.publish(
+                RunFinishedEvent(
+                    run_id=run_id,
+                    status="failed",
+                    total_steps=0,
+                    duration_ms=0,
+                    summary=reason,
+                    reason=reason,
+                )
+            )
+        finally:
+            writer.close()
 
     # 回收已结束的后台任务并记录未处理的运行异常。
     def _record_agent_task_result(self, task: asyncio.Task[Any]) -> None:
@@ -74,8 +123,10 @@ class CoreApp:
         # 注册handler以及需要tcp连接的handler
         server.register("core.ping", self._ping_handler)
         server.register_connection_handler("event.subscribe", self._event_subscribe_handler)
+        server.register("event.unsubscribe", self._event_unsubscribe_handler)
+        server.register("event.list", self._event_list_handler)
         server.register("agent.run", self._agent_run_handler)
-        server.add_disconnect_handler(self._event_broadcaster.unsubscribe)
+        server.add_disconnect_handler(self._event_broadcaster.unsubscribe_writer)
 
         await server.start()
         stopped = asyncio.Event()

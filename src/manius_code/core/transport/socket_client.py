@@ -10,6 +10,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from manius_code.core.bus.envelope import JsonRpcError, JsonRpcRequest, JsonRpcSuccess
+from manius_code.core.bus.events import EventPushEnvelope
 
 logger = logging.getLogger(__name__)
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -94,8 +95,12 @@ class SocketClient:
             raise IpcError(-32700, "Received invalid JSON") from error
         if not isinstance(message, dict):
             raise IpcError(-32600, "Received invalid JSON-RPC message")
-        if message.get("kind") == "event":
-            await self.on_event(message)
+        if message.get("method") == "event.push":
+            try:
+                event = EventPushEnvelope.model_validate(message).params
+            except ValidationError as error:
+                raise IpcError(-32600, "Received invalid event notification") from error
+            await self.on_event(event.model_dump(mode="json"))
             return
         request_id = message.get("id")
         if isinstance(request_id, str) and request_id in self._pending:
