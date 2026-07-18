@@ -20,6 +20,7 @@ from manius_code.core.transport.socket_client import IpcError, SocketClient
 
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 _RETRY_DELAY_SECONDS = 2
+_TOKEN_FLUSH_INTERVAL_SECONDS = 0.08
 
 
 class ManiusTui(App[None]):
@@ -61,6 +62,7 @@ class ManiusTui(App[None]):
         self._socket_worker: Worker[None] | None = None
         self._token_buffer = ""
         self._token_run_id: str | None = None
+        self._token_stream_open = False
 
     # 组合固定状态栏和可滚动的富文本事件日志区域。
     def compose(self) -> ComposeResult:
@@ -73,6 +75,7 @@ class ManiusTui(App[None]):
     def on_mount(self) -> None:
         self._set_disconnected_status()
         self.query_one("#event-log", RichLog).focus()
+        self.set_interval(_TOKEN_FLUSH_INTERVAL_SECONDS, self._flush_token_buffer)
         self._socket_worker = self.run_worker(self.socket_loop(), exclusive=True, name="socket")
 
     # 卸载时取消 Worker，由其 finally 块完成退订和连接关闭。
@@ -106,6 +109,7 @@ class ManiusTui(App[None]):
                 pass
             finally:
                 self._flush_token_buffer()
+                self._token_stream_open = False
                 try:
                     if sub_id is not None and event_loop_task is not None and not event_loop_task.done():
                         with suppress(IpcError, OSError, RuntimeError, ValidationError):
@@ -133,6 +137,7 @@ class ManiusTui(App[None]):
             self._token_run_id = event.run_id
             return
         self._flush_token_buffer()
+        self._token_stream_open = False
         self.query_one("#event-log", RichLog).write(self._format_event(event))
 
     # 将缓冲的流式文本作为一条普通富文本日志一次性写入。
@@ -142,7 +147,12 @@ class ManiusTui(App[None]):
         run_id = self._token_run_id or "unknown"
         token_text = Text()
         token_text.append(f"[{run_id}] ", style="dim")
-        token_text.append(self._token_buffer)
+        if not self._token_stream_open:
+            token_text.append("LLM │ ", style="bold magenta")
+            self._token_stream_open = True
+        else:
+            token_text.append("    │ ", style="magenta")
+        token_text.append(self._token_buffer, style="default")
         self.query_one("#event-log", RichLog).write(token_text)
         self._token_buffer = ""
         self._token_run_id = None

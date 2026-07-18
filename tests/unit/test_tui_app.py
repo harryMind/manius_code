@@ -5,7 +5,7 @@ from manius_code.core.bus.events import LlmTokenEvent, RunFinishedEvent, RunStar
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.transport.socket_server import SocketServer
-from manius_code.tui.app import ManiusTui
+from manius_code.tui.app import _TOKEN_FLUSH_INTERVAL_SECONDS, ManiusTui
 from textual.widgets import RichLog
 
 
@@ -37,6 +37,25 @@ def test_tui_buffers_tokens_until_a_non_token_event_arrives() -> None:
             await app.handle_event(StepPlanningEvent(run_id="run-a", step=1, plan="continue").model_dump(mode="json"))
             assert app._token_buffer == ""
             assert len(log.lines) >= initial_lines + 2
+
+    asyncio.run(exercise())
+
+
+# 功能：验证 TUI 定时批量刷新 token，实现不等待步骤事件的连续流式展示。
+# 设计：在真实 Textual 定时器环境中等待两个刷新周期，断言缓冲被自动清空且日志已追加。
+def test_tui_periodically_flushes_token_buffer() -> None:
+    # 驱动 TUI 定时器批量写入 LLM token 缓冲。
+    async def exercise() -> None:
+        app = ManiusTui(ManiusConfig(port=1))
+        async with app.run_test() as pilot:
+            log = app.query_one("#event-log", RichLog)
+            initial_lines = len(log.lines)
+            await app.handle_event(LlmTokenEvent(run_id="run-a", token="streaming").model_dump(mode="json"))
+            await asyncio.sleep(_TOKEN_FLUSH_INTERVAL_SECONDS * 2)
+            await pilot.pause()
+            assert app._token_buffer == ""
+            assert app._token_stream_open
+            assert len(log.lines) > initial_lines
 
     asyncio.run(exercise())
 
