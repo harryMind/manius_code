@@ -61,8 +61,6 @@ class ManiusTui(App[None]):
         self._client: SocketClient | None = None
         self._socket_worker: Worker[None] | None = None
         self._token_buffer = ""
-        self._token_run_id: str | None = None
-        self._token_stream_open = False
 
     # 组合固定状态栏和可滚动的富文本事件日志区域。
     def compose(self) -> ComposeResult:
@@ -109,7 +107,6 @@ class ManiusTui(App[None]):
                 pass
             finally:
                 self._flush_token_buffer()
-                self._token_stream_open = False
                 try:
                     if sub_id is not None and event_loop_task is not None and not event_loop_task.done():
                         with suppress(IpcError, OSError, RuntimeError, ValidationError):
@@ -134,28 +131,18 @@ class ManiusTui(App[None]):
             return
         if isinstance(event, LlmTokenEvent):
             self._token_buffer += event.token
-            self._token_run_id = event.run_id
             return
         self._flush_token_buffer()
-        self._token_stream_open = False
+        if event.type in {"llm_request", "llm_response"}:
+            return
         self.query_one("#event-log", RichLog).write(self._format_event(event))
 
     # 将缓冲的流式文本作为一条普通富文本日志一次性写入。
     def _flush_token_buffer(self) -> None:
         if not self._token_buffer:
             return
-        run_id = self._token_run_id or "unknown"
-        token_text = Text()
-        token_text.append(f"[{run_id}] ", style="dim")
-        if not self._token_stream_open:
-            token_text.append("LLM │ ", style="bold magenta")
-            self._token_stream_open = True
-        else:
-            token_text.append("    │ ", style="magenta")
-        token_text.append(self._token_buffer, style="default")
-        self.query_one("#event-log", RichLog).write(token_text)
+        self.query_one("#event-log", RichLog).write(Text(self._token_buffer))
         self._token_buffer = ""
-        self._token_run_id = None
 
     # 按事件类型构造带任务标识和语义配色的 Rich 文本行。
     def _format_event(self, event: AgentEvent) -> Text:
@@ -185,10 +172,6 @@ class ManiusTui(App[None]):
             case "tool_call_failed":
                 text.append("TOOL FAILED ", style="bold red")
                 text.append(f"{event.tool_name}: {event.error}")
-            case "llm_request":
-                text.append("LLM REQUEST", style="dim")
-            case "llm_response":
-                text.append(f"LLM RESPONSE ({event.duration_ms}ms)", style="dim")
         return text
 
     # 渲染成功或失败的任务完成信息。

@@ -1,7 +1,10 @@
 import asyncio
 from typing import Any
 
-from manius_code.core.bus.events import LlmTokenEvent, RunFinishedEvent, RunStartedEvent, StepPlanningEvent
+import pytest
+from rich.text import Text
+
+from manius_code.core.bus.events import LlmResponseEvent, LlmTokenEvent, RunFinishedEvent, RunStartedEvent, StepPlanningEvent
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.transport.socket_server import SocketServer
@@ -43,19 +46,30 @@ def test_tui_buffers_tokens_until_a_non_token_event_arrives() -> None:
 
 # 功能：验证 TUI 定时批量刷新 token，实现不等待步骤事件的连续流式展示。
 # 设计：在真实 Textual 定时器环境中等待两个刷新周期，断言缓冲被自动清空且日志已追加。
-def test_tui_periodically_flushes_token_buffer() -> None:
+def test_tui_periodically_flushes_plain_token_results(monkeypatch: pytest.MonkeyPatch) -> None:
     # 驱动 TUI 定时器批量写入 LLM token 缓冲。
     async def exercise() -> None:
         app = ManiusTui(ManiusConfig(port=1))
         async with app.run_test() as pilot:
             log = app.query_one("#event-log", RichLog)
-            initial_lines = len(log.lines)
+            captured: list[Text] = []
+            original_write = RichLog.write
+
+            # 收集真实 RichLog 写入内容以校验不混入内部 LLM 事件标签。
+            def capture_write(widget: RichLog, content: Text, *args: Any, **kwargs: Any) -> RichLog:
+                if isinstance(content, Text):
+                    captured.append(content)
+                return original_write(widget, content, *args, **kwargs)
+
+            monkeypatch.setattr(RichLog, "write", capture_write)
             await app.handle_event(LlmTokenEvent(run_id="run-a", token="streaming").model_dump(mode="json"))
             await asyncio.sleep(_TOKEN_FLUSH_INTERVAL_SECONDS * 2)
             await pilot.pause()
             assert app._token_buffer == ""
-            assert app._token_stream_open
-            assert len(log.lines) > initial_lines
+            await app.handle_event(
+                LlmResponseEvent(run_id="run-a", duration_ms=1, text="streaming", tool_calls=[]).model_dump(mode="json")
+            )
+            assert [content.plain for content in captured] == ["streaming"]
 
     asyncio.run(exercise())
 
