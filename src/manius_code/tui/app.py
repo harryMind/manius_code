@@ -7,10 +7,11 @@ from contextlib import suppress
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
+from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal
-from textual.widgets import RichLog, Static
+from textual.containers import VerticalScroll
+from textual.widgets import Static
 from textual.worker import Worker
 
 from manius_code.core.bus.commands import EventSubscribeResult, EventUnsubscribeResult
@@ -29,93 +30,148 @@ M   M  A   A  N  NN    I    U   U      S  C      O   O  D   D  E
 M   M  A   A  N   N  IIIII   UUU   SSSS   CCCC   OOO   DDDD   EEEEE"""
 
 
+# 截断长字段以保持工具调用摘要在窄终端中可读。
+def _preview(value: str, limit: int = 96) -> str:
+    return value if len(value) <= limit else f"{value[: limit - 3]}..."
+
+
+class LlmStreamBlock(Static):
+    """A single result block that is updated while the LLM is streaming."""
+
+    DEFAULT_CSS = "LLMStreamBlock { padding: 0 2; color: $text; }"
+
+    # 初始化一个用于累积并原地更新结果文本的流式组件。
+    def __init__(self) -> None:
+        super().__init__("")
+        self._text = ""
+        self._finalized = False
+
+    # 追加一批 token 并更新同一组件，避免为每个 token 新建日志行。
+    def append_text(self, text: str) -> None:
+        if self._finalized:
+            return
+        self._text += text
+        self.update(self._text)
+
+    # 结束流式阶段后将完整结果升级为 Markdown 渲染。
+    def finalize(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        if self._text.strip():
+            self.update(Markdown(self._text, code_theme="monokai"))
+
+
+class ToolCallBlock(Static):
+    """A compact tool-call row that changes state in place."""
+
+    DEFAULT_CSS = "ToolCallBlock { padding: 0 2; color: $text-muted; }"
+
+    # 初始化工具调用摘要及其等待完成的状态。
+    def __init__(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        self._tool_name = tool_name
+        self._arguments = arguments
+        self._duration_ms: int | None = None
+        self._error: str | None = None
+        super().__init__(self._render())
+
+    # 根据工具状态生成一行带颜色的摘要文本。
+    def _render(self) -> Text:
+        text = Text("  ")
+        text.append("tool ", style="dim")
+        text.append(self._tool_name, style="bold")
+        arguments = _preview(json.dumps(self._arguments, ensure_ascii=False, default=str), 96)
+        if arguments:
+            text.append(f"  {arguments}", style="dim")
+        if self._duration_ms is None:
+            text.append("  running", style="yellow")
+        elif self._error is None:
+            text.append(f"  done  {self._duration_ms}ms", style="green")
+        else:
+            text.append(f"  failed  {self._duration_ms}ms", style="red")
+            text.append(f"  {_preview(self._error)}", style="red")
+        return text
+
+    # 将工具调用更新为成功或失败的最终状态。
+    def finish(self, duration_ms: int, error: str | None = None) -> None:
+        self._duration_ms = duration_ms
+        self._error = error
+        self.update(self._render())
+
+
 class ManiusTui(App[None]):
-    """Observe all daemon Agent events through a reconnecting socket client."""
+    """Read-only daemon event observer built with reusable IPC components."""
 
+    TITLE = "maniuscode"
+    BINDINGS = [("q", "quit", "Quit")]
     CSS = """
-    Screen {
-        layout: vertical;
-    }
+    Screen { background: $background; }
 
-    #status-bar {
+    #header {
         height: 1;
+        background: $surface;
+        color: $text;
         padding: 0 1;
-        background: $panel;
     }
 
-    #brand-name {
-        width: auto;
-        margin-right: 2;
-        text-style: bold;
-    }
-
-    #daemon-address {
-        width: auto;
-        margin-right: 2;
-        color: $text-muted;
-    }
-
-    #connection-status {
-        width: 1fr;
-    }
-
-    #subscription-mode {
-        width: auto;
-        text-align: right;
-        color: $text-muted;
-    }
-
-    #event-log {
+    #log-view {
         height: 1fr;
-        margin: 1 2 0 2;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
     }
 
-    #logo {
-        height: 5;
-        margin: 1 2 0 2;
-        color: cyan;
-        text-style: bold;
-    }
-
-    #logo-caption {
-        height: 1;
-        margin: 0 3;
-        color: $text-muted;
-    }
+    #banner { padding: 1 2 0 2; }
+    Static.run-header { color: $text-muted; padding: 1 2 0 2; }
+    Static.step-divider { color: $text-muted; padding: 0 2; }
+    Static.run-ok { color: green; padding: 0 2 1 2; }
+    Static.run-err { color: red; padding: 0 2 1 2; }
+    Static.log-line { padding: 0 2; }
     """
 
-    BINDINGS = [("q", "quit", "Quit")]
-
-    # 保存 daemon 配置、当前连接及流式文本缓冲状态。
+    # 保存 daemon 配置、连接、流式结果块和待完成的工具调用块。
     def __init__(self, config: ManiusConfig) -> None:
         super().__init__()
         self._config = config
         self._client: SocketClient | None = None
         self._socket_worker: Worker[None] | None = None
-        self._token_buffer = ""
+        self._token_buffers: dict[str, str] = {}
+        self._stream_blocks: dict[str, LlmStreamBlock] = {}
+        self._tool_blocks: dict[tuple[str, str], ToolCallBlock] = {}
 
-    # 组合固定状态栏和可滚动的富文本事件日志区域。
+    # 组合状态栏和可滚动的组件化事件视图。
     def compose(self) -> ComposeResult:
-        with Horizontal(id="status-bar"):
-            yield Static("maniuscode", id="brand-name")
-            yield Static(f"{self._config.host}:{self._config.port}", id="daemon-address")
-            yield Static(id="connection-status")
-            yield Static("global", id="subscription-mode")
-        yield Static(_MANIUSCODE_LOGO, id="logo")
-        yield Static("daemon event observer  •  press q to quit", id="logo-caption")
-        yield RichLog(id="event-log", auto_scroll=True, markup=False, wrap=True)
+        yield Static(id="header")
+        yield VerticalScroll(id="log-view")
 
-    # 挂载后使用 Textual Worker 管理常驻 socket 连接循环。
+    # 挂载 Logo、启动 token 批量刷新定时器和 socket Worker。
     def on_mount(self) -> None:
-        self._set_disconnected_status()
-        self.query_one("#event-log", RichLog).focus()
-        self.set_interval(_TOKEN_FLUSH_INTERVAL_SECONDS, self._flush_token_buffer)
+        banner = Text(_MANIUSCODE_LOGO, style="bold cyan")
+        banner.append("\n  daemon event observer  •  press q to quit", style="dim")
+        self._append(Static(banner, id="banner"))
+        self._update_header("connecting")
+        self.set_interval(_TOKEN_FLUSH_INTERVAL_SECONDS, self._flush_token_buffers)
         self._socket_worker = self.run_worker(self.socket_loop(), exclusive=True, name="socket")
 
     # 卸载时取消 Worker，由其 finally 块完成退订和连接关闭。
     def on_unmount(self) -> None:
         if self._socket_worker is not None:
             self._socket_worker.cancel()
+
+    # 将事件组件挂入滚动视图并始终保持最新内容可见。
+    def _append(self, widget: Static) -> None:
+        log_view = self.query_one("#log-view", VerticalScroll)
+        log_view.mount(widget)
+        log_view.scroll_end(animate=False)
+
+    # 根据连接状态更新紧凑的品牌、地址和订阅状态栏。
+    def _update_header(self, state: str) -> None:
+        color = {"connected": "green", "connecting": "yellow", "disconnected": "red"}[state]
+        header = Text()
+        header.append("maniuscode", style="bold")
+        header.append(f"  {self._config.host}:{self._config.port}", style="dim")
+        header.append(f"  {state}", style=color)
+        header.append("  global", style="dim")
+        self.query_one("#header", Static).update(header)
 
     # 循环连接 daemon、订阅全局事件并在断线后自动重试。
     async def socket_loop(self) -> None:
@@ -126,13 +182,13 @@ class ManiusTui(App[None]):
             event_loop_task: asyncio.Task[None] | None = None
             try:
                 await client.connect()
-                self._set_connected_status()
                 subscription_response = await client.send_command(
                     "event.subscribe",
                     {"type": "event.subscribe", "run_id": None, "topics": ["*"]},
                 )
                 subscription = EventSubscribeResult.model_validate(subscription_response.result)
                 sub_id = subscription.sub_id
+                self._update_header("connected")
                 event_loop_task = client._event_loop_task
                 if event_loop_task is None:
                     raise RuntimeError("SocketClient did not start its event loop")
@@ -142,7 +198,7 @@ class ManiusTui(App[None]):
             except (IpcError, OSError, RuntimeError, ValidationError):
                 pass
             finally:
-                self._flush_token_buffer()
+                self._finish_all_streams()
                 try:
                     if sub_id is not None and event_loop_task is not None and not event_loop_task.done():
                         with suppress(IpcError, OSError, RuntimeError, ValidationError):
@@ -156,76 +212,99 @@ class ManiusTui(App[None]):
                         await client.close()
                     if self._client is client:
                         self._client = None
-            self._set_disconnected_status()
+            self._update_header("disconnected")
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
 
-    # 校验服务端推送事件并统一分发到日志渲染逻辑。
+    # 校验服务端事件后交由组件化渲染逻辑处理，非法事件直接忽略。
     async def handle_event(self, message: dict[str, Any]) -> None:
         try:
             event = _EVENT_ADAPTER.validate_python(message)
         except ValidationError:
             return
+        self._handle_agent_event(event)
+
+    # 按事件类型更新流式结果块、工具块或新增普通事件组件。
+    def _handle_agent_event(self, event: AgentEvent) -> None:
         if isinstance(event, LlmTokenEvent):
-            self._token_buffer += event.token
+            self._token_buffers[event.run_id] = self._token_buffers.get(event.run_id, "") + event.token
             return
-        self._flush_token_buffer()
-        if event.type in {"llm_request", "llm_response"}:
-            return
-        self.query_one("#event-log", RichLog).write(self._format_event(event))
-
-    # 将缓冲的流式文本作为一条普通富文本日志一次性写入。
-    def _flush_token_buffer(self) -> None:
-        if not self._token_buffer:
-            return
-        self.query_one("#event-log", RichLog).write(Text(self._token_buffer))
-        self._token_buffer = ""
-
-    # 按事件类型构造带任务标识和语义配色的 Rich 文本行。
-    def _format_event(self, event: AgentEvent) -> Text:
-        text = Text()
-        text.append(f"[{event.run_id}] ", style="dim")
+        self._finish_stream(event.run_id)
         match event.type:
             case "run_started":
-                text.append("RUN ", style="bold blue")
-                text.append(event.goal)
-            case "run_finished":
-                self._append_run_finished(text, event)
+                self._append(
+                    Static(
+                        f"run  [cyan]{event.run_id}[/cyan]  [dim]{_preview(event.goal)}[/dim]",
+                        classes="run-header",
+                    )
+                )
             case "step_planning":
-                text.append(f"STEP {event.step} ", style="bold cyan")
-                text.append(event.plan)
+                self._append(Static(f"step {event.step}  [cyan]{event.plan}[/cyan]", classes="step-divider"))
             case "step_done":
-                text.append(f"STEP {event.step} DONE ", style="dim")
-                text.append(event.observation)
+                if not event.complete:
+                    self._append(Static(f"  [dim]{_preview(event.observation)}[/dim]", classes="log-line"))
             case "tool_call_start":
-                arguments = json.dumps(event.arguments, ensure_ascii=False, default=str)
-                if len(arguments) > 160:
-                    arguments = f"{arguments[:157]}..."
-                text.append("CALL ", style="bold yellow")
-                text.append(f"{event.tool_name} {arguments}")
+                block = ToolCallBlock(event.tool_name, event.arguments)
+                self._tool_blocks[(event.run_id, event.tool_name)] = block
+                self._append(block)
             case "tool_call_success":
-                text.append("TOOL ", style="bold green")
-                text.append(f"{event.tool_name} ({event.duration_ms}ms)")
+                self._finish_tool(event.run_id, event.tool_name, event.duration_ms)
             case "tool_call_failed":
-                text.append("TOOL FAILED ", style="bold red")
-                text.append(f"{event.tool_name}: {event.error}")
-        return text
+                self._finish_tool(event.run_id, event.tool_name, event.duration_ms, event.error)
+            case "run_finished":
+                self._append(self._run_finished_widget(event))
 
-    # 渲染成功或失败的任务完成信息。
-    def _append_run_finished(self, text: Text, event: RunFinishedEvent) -> None:
-        if event.status == "success":
-            text.append("FINISHED ", style="bold green")
-            text.append(f"{event.duration_ms}ms")
+    # 将同一任务当前缓冲的 token 追加到唯一的流式结果组件。
+    def _flush_token_buffers(self) -> None:
+        buffers = self._token_buffers
+        self._token_buffers = {}
+        for run_id, text in buffers.items():
+            if not text:
+                continue
+            block = self._stream_blocks.get(run_id)
+            if block is None:
+                block = LlmStreamBlock()
+                self._stream_blocks[run_id] = block
+                self._append(block)
+            block.append_text(text)
+        if buffers:
+            self.query_one("#log-view", VerticalScroll).scroll_end(animate=False)
+
+    # 完成指定任务的流式结果块并在后续事件前进行 Markdown 渲染。
+    def _finish_stream(self, run_id: str) -> None:
+        self._flush_token_buffers()
+        block = self._stream_blocks.pop(run_id, None)
+        if block is not None:
+            block.finalize()
+
+    # 连接关闭或应用退出时完成全部尚未结束的流式结果。
+    def _finish_all_streams(self) -> None:
+        self._flush_token_buffers()
+        for block in self._stream_blocks.values():
+            block.finalize()
+        self._stream_blocks.clear()
+
+    # 将指定工具调用块更新为成功或失败状态。
+    def _finish_tool(self, run_id: str, tool_name: str, duration_ms: int, error: str | None = None) -> None:
+        block = self._tool_blocks.pop((run_id, tool_name), None)
+        if block is None:
+            status = "failed" if error else "done"
+            detail = f": {error}" if error else ""
+            self._append(Static(f"  tool {tool_name}  {status}  {duration_ms}ms{detail}", classes="log-line"))
             return
-        text.append("FAILED ", style="bold red")
-        text.append(event.reason or "unknown error")
+        block.finish(duration_ms, error)
 
-    # 更新状态栏为已连接的 daemon 地址。
-    def _set_connected_status(self) -> None:
-        self.query_one("#connection-status", Static).update(Text("connected", style="green"))
-
-    # 更新状态栏为断线后的自动重连提示。
-    def _set_disconnected_status(self) -> None:
-        self.query_one("#connection-status", Static).update(Text("disconnected - retrying...", style="red"))
+    # 生成任务成功或失败的收尾组件。
+    def _run_finished_widget(self, event: RunFinishedEvent) -> Static:
+        if event.status == "success":
+            return Static(
+                f"completed  [dim]{event.total_steps} steps  {event.duration_ms}ms[/dim]",
+                classes="run-ok",
+            )
+        reason = f"  [dim]{event.reason}[/dim]" if event.reason else ""
+        return Static(
+            f"failed{reason}  [dim]{event.total_steps} steps  {event.duration_ms}ms[/dim]",
+            classes="run-err",
+        )
 
 
 # 加载配置并启动常驻的 Textual 观测客户端。
