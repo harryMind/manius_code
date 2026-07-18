@@ -2,49 +2,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+from contextlib import suppress
+from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from manius_code.core.bus.commands import AgentRunResult
+from manius_code.core.bus.commands import AgentRunResult, EventListResult, EventSubscribeResult
 from manius_code.core.config import ManiusConfig
-from manius_code.core.events.models import AgentEvent, RunFinishedEvent
+from manius_code.core.bus.events import AgentEvent, RunFinishedEvent
 from manius_code.core.events.subscribers import StdoutPrinter
-from manius_code.core.transport.socket_client import SocketClient
+from manius_code.core.transport.socket_client import IpcError, SocketClient
 
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
-
-
-class RunEventClient(SocketClient):
-    # 初始化事件打印器和按运行标识索引的完成通知。
-    def __init__(self, host: str, port: int, printer: StdoutPrinter) -> None:
-        super().__init__(host, port)
-        self._printer = printer
-        self._finished_events: dict[str, RunFinishedEvent] = {}
-        self._finished_waiters: dict[str, asyncio.Event] = {}
-
-    # 反序列化服务端事件通知、实时打印并唤醒已完成任务的等待者。
-    async def on_event(self, message: dict[str, object]) -> None:
-        if message.get("method") != "event.push" or not isinstance(message.get("params"), dict):
-            return
-        try:
-            event = _EVENT_ADAPTER.validate_python(message["params"])
-        except ValidationError:
-            return
-        self._printer.handle(event)
-        if isinstance(event, RunFinishedEvent):
-            self._finished_events[event.run_id] = event
-            waiter = self._finished_waiters.get(event.run_id)
-            if waiter is not None:
-                waiter.set()
-
-    # 等待指定运行的完成事件并返回服务端汇总状态。
-    async def wait_for_finished(self, run_id: str) -> RunFinishedEvent:
-        finished_event = self._finished_events.get(run_id)
-        if finished_event is not None:
-            return finished_event
-        waiter = self._finished_waiters.setdefault(run_id, asyncio.Event())
-        await waiter.wait()
-        return self._finished_events[run_id]
 
 
 # 向 CLI 解析器注册前台 Agent 运行命令。
@@ -57,19 +27,81 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 # 运行 Agent 并以进程状态码表示任务是否成功完成。
 # 通过订阅、远程调用和完成事件等待执行一次 daemon 托管任务。
 async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
-    client = RunEventClient(config.host, config.port, StdoutPrinter())
-    await client.connect()
+    printer = StdoutPrinter()
+    finished_events: dict[str, RunFinishedEvent] = {}
+    finished_signal = asyncio.Event()
+    sub_id: str | None = None
+
+    # 渲染服务端事件，并记录已结束的远程运行。 处理服务端推送的event
+    async def consume_event(message: dict[str, Any], render: bool = True) -> None:
+        try:
+            event = _EVENT_ADAPTER.validate_python(message)
+        except ValidationError:
+            return
+        if render:
+            printer.handle(event)
+        if isinstance(event, RunFinishedEvent):
+            finished_events[event.run_id] = event
+            finished_signal.set() # 唤醒在服务端的await事件
+
+    # 等待目标运行的完成事件，并保留其他订阅任务的事件。
+    # 将实时推送事件交给统一的事件消费逻辑。
+    async def handle_event(message: dict[str, Any]) -> None:
+        await consume_event(message)
+
+    # 精确等待指定运行任务的完成事件，忽略其他任务的完成通知。
+    async def wait_for_finished(run_id: str) -> RunFinishedEvent:
+        while run_id not in finished_events:
+            await finished_signal.wait()
+            finished_signal.clear()
+        return finished_events[run_id]
+
+    client = SocketClient(config.host, config.port, event_handler=handle_event)
     try:
-        await client.send_command("event.subscribe", {"type": "event.subscribe"})
+        await client.connect()
         response = await client.send_command("agent.run", {"type": "agent.run", "goal": goal})
         started = AgentRunResult.model_validate(response.result)
-        return await client.wait_for_finished(started.run_id)
+        history = EventListResult.model_validate(
+            (await client.send_command("event.list", {"type": "event.list", "run_id": started.run_id})).result
+        )
+        for event in history.events:
+            await consume_event(event)
+        if started.run_id in finished_events:
+            return finished_events[started.run_id]
+        subscription = EventSubscribeResult.model_validate(
+            (
+                await client.send_command(
+                    "event.subscribe",
+                    {"type": "event.subscribe", "run_id": started.run_id, "topics": ["*"]},
+                )
+            ).result
+        )
+        sub_id = subscription.sub_id
+        current_history = EventListResult.model_validate(
+            (await client.send_command("event.list", {"type": "event.list", "run_id": started.run_id})).result
+        )
+        for event in current_history.events:
+            await consume_event(event, render=False)
+        return await wait_for_finished(started.run_id)
     finally:
-        await client.close()
+        try:
+            if sub_id is not None:
+                with suppress(IpcError, OSError):
+                    await client.send_command("event.unsubscribe", {"type": "event.unsubscribe", "sub_id": sub_id})
+        finally:
+            with suppress(OSError):
+                await client.close()
 
 
 # 运行远程 Agent 并以最终事件状态表示命令是否成功完成。
 def run(config: ManiusConfig, goal: str) -> None:
-    finished_event = asyncio.run(_run_remote(config, goal))
+    try:
+        finished_event = asyncio.run(_run_remote(config, goal))
+    except IpcError as error:
+        print(f"manius: IPC request failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except (OSError, ValidationError) as error:
+        print(f"manius: unable to run task: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
     if finished_event.status != "success":
         raise SystemExit(1)

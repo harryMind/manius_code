@@ -1,6 +1,6 @@
 from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import StepDoneEvent, StepPlanningEvent
+from manius_code.core.bus.events import StepDoneEvent, StepPlanningEvent
 from manius_code.core.llm.anthropic import AnthropicProvider
 from manius_code.core.tools.invocation import ToolInvoker
 

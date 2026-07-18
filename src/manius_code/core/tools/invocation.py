@@ -3,7 +3,7 @@ from collections.abc import Callable
 from typing import Any
 
 from manius_code.core.events.bus import EventBus
-from manius_code.core.events.models import ToolCallFailedEvent, ToolCallStartEvent, ToolCallSuccessEvent
+from manius_code.core.bus.events import ToolCallFailedEvent, ToolCallStartEvent, ToolCallSuccessEvent
 from manius_code.core.tools.registry import ToolRegistry
 
 

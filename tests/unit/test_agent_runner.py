@@ -98,14 +98,13 @@ def test_agent_runner_records_max_steps_failure_in_summary_and_event(tmp_path: P
     assert finished_event["reason"] == "Agent exceeded max_steps=1"
 
 
-# 功能：验证关闭本地事件打印后，AgentRunner 仍会完成任务并持久化事件。
-# 设计：注入会失败的确定性 Provider，使测试仅关注标准输出开关而不依赖文件工具或外部模型。
-def test_agent_runner_can_disable_local_event_output(tmp_path: Path, capsys) -> None:
+# 功能：验证 daemon 运行器不会本地打印事件，但仍会完成任务并持久化事件。
+# 设计：注入会失败的确定性 Provider，使测试仅关注服务端无终端输出的职责边界。
+def test_agent_runner_does_not_print_local_events(tmp_path: Path, capsys) -> None:
     runner = AgentRunner(
         ManiusConfig(max_steps=1),
         runs_dir=tmp_path / "runs",
         provider_factory=lambda _bus, _tools: FailingAnthropicProvider(),
-        print_events=False,
     )
     summary = asyncio.run(runner.run("Fail without daemon output"))
     event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
