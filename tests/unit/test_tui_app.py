@@ -8,8 +8,8 @@ from manius_code.core.bus.events import LlmResponseEvent, LlmTokenEvent, RunFini
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.transport.socket_server import SocketServer
-from manius_code.tui.app import _TOKEN_FLUSH_INTERVAL_SECONDS, ManiusTui
-from textual.widgets import RichLog
+from manius_code.tui.app import _MANIUSCODE_LOGO, _TOKEN_FLUSH_INTERVAL_SECONDS, ManiusTui
+from textual.widgets import RichLog, Static
 
 
 # 功能：验证 TUI 将事件按 run_id 和状态生成带语义标签的富文本。
@@ -23,6 +23,20 @@ def test_tui_formats_events_with_run_id_and_status() -> None:
 
     assert started.plain == "[run-a] RUN inspect README"
     assert finished.plain == "[run-b] FINISHED 42ms"
+
+
+# 功能：验证 TUI 顶部包含 ManiusCode ASCII 品牌标志和守护进程地址。
+# 设计：挂载实际 Textual 应用后按组件 ID 查询，覆盖静态布局而不依赖终端截图比对。
+def test_tui_displays_maniuscode_logo_and_daemon_address() -> None:
+    # 驱动应用挂载并校验品牌与连接信息组件。
+    async def exercise() -> None:
+        app = ManiusTui(ManiusConfig(host="127.0.0.1", port=7437))
+        async with app.run_test():
+            assert _MANIUSCODE_LOGO.startswith("M   M")
+            assert app.query_one("#logo", Static) is not None
+            assert app.query_one("#daemon-address", Static).render() == "127.0.0.1:7437"
+
+    asyncio.run(exercise())
 
 
 # 功能：验证 LLM token 只在后续非 token 事件到达时批量写入日志。

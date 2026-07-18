@@ -21,6 +21,12 @@ from manius_code.core.transport.socket_client import IpcError, SocketClient
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 _RETRY_DELAY_SECONDS = 2
 _TOKEN_FLUSH_INTERVAL_SECONDS = 0.08
+_MANIUSCODE_LOGO = """\
+M   M   AAA   N   N  IIIII  U   U   SSSS   CCCC   OOO   DDDD   EEEEE
+MM MM  A   A  NN  N    I    U   U  S      C      O   O  D   D  E
+M M M  AAAAA  N N N    I    U   U   SSS   C      O   O  D   D  EEEE
+M   M  A   A  N  NN    I    U   U      S  C      O   O  D   D  E
+M   M  A   A  N   N  IIIII   UUU   SSSS   CCCC   OOO   DDDD   EEEEE"""
 
 
 class ManiusTui(App[None]):
@@ -34,7 +40,19 @@ class ManiusTui(App[None]):
     #status-bar {
         height: 1;
         padding: 0 1;
-        background: $surface;
+        background: $panel;
+    }
+
+    #brand-name {
+        width: auto;
+        margin-right: 2;
+        text-style: bold;
+    }
+
+    #daemon-address {
+        width: auto;
+        margin-right: 2;
+        color: $text-muted;
     }
 
     #connection-status {
@@ -49,6 +67,20 @@ class ManiusTui(App[None]):
 
     #event-log {
         height: 1fr;
+        margin: 1 2 0 2;
+    }
+
+    #logo {
+        height: 5;
+        margin: 1 2 0 2;
+        color: cyan;
+        text-style: bold;
+    }
+
+    #logo-caption {
+        height: 1;
+        margin: 0 3;
+        color: $text-muted;
     }
     """
 
@@ -65,8 +97,12 @@ class ManiusTui(App[None]):
     # 组合固定状态栏和可滚动的富文本事件日志区域。
     def compose(self) -> ComposeResult:
         with Horizontal(id="status-bar"):
+            yield Static("maniuscode", id="brand-name")
+            yield Static(f"{self._config.host}:{self._config.port}", id="daemon-address")
             yield Static(id="connection-status")
             yield Static("global", id="subscription-mode")
+        yield Static(_MANIUSCODE_LOGO, id="logo")
+        yield Static("daemon event observer  •  press q to quit", id="logo-caption")
         yield RichLog(id="event-log", auto_scroll=True, markup=False, wrap=True)
 
     # 挂载后使用 Textual Worker 管理常驻 socket 连接循环。
@@ -185,13 +221,11 @@ class ManiusTui(App[None]):
 
     # 更新状态栏为已连接的 daemon 地址。
     def _set_connected_status(self) -> None:
-        self.query_one("#connection-status", Static).update(
-            Text(f"connected {self._config.host}:{self._config.port}", style="green")
-        )
+        self.query_one("#connection-status", Static).update(Text("connected", style="green"))
 
     # 更新状态栏为断线后的自动重连提示。
     def _set_disconnected_status(self) -> None:
-        self.query_one("#connection-status", Static).update(Text("disconnected - retrying...", style="yellow"))
+        self.query_one("#connection-status", Static).update(Text("disconnected - retrying...", style="red"))
 
 
 # 加载配置并启动常驻的 Textual 观测客户端。
