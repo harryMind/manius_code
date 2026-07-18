@@ -1,6 +1,8 @@
 import asyncio
+import inspect
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 from uuid import uuid4
@@ -10,6 +12,7 @@ from pydantic import ValidationError
 from manius_code.core.bus.envelope import JsonRpcError, JsonRpcRequest, JsonRpcSuccess
 
 logger = logging.getLogger(__name__)
+EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 class IpcError(RuntimeError):
@@ -22,9 +25,10 @@ class IpcError(RuntimeError):
 
 class SocketClient:
     # 保存 daemon 地址和长连接状态。
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, event_handler: EventHandler | None = None) -> None:
         self._host = host
         self._port = port
+        self._event_handler = event_handler
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._event_loop_task: asyncio.Task[None] | None = None
@@ -112,7 +116,11 @@ class SocketClient:
 
     # 为未来服务端事件推送预留处理接口。
     async def on_event(self, event: dict[str, Any]) -> None:
-        return None
+        if self._event_handler is None:
+            return
+        result = self._event_handler(event)
+        if inspect.isawaitable(result):
+            await result
 
     # 以同一异常结束全部尚未匹配响应的请求。
     def _fail_pending(self, error: IpcError) -> None:
