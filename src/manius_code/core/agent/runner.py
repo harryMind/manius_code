@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.agent.loop import AgentLoop
 from manius_code.core.config import ManiusConfig
-from manius_code.core.events.bus import EventBus
+from manius_code.core.events.bus import EventBus, Subscriber
 from manius_code.core.events.models import RunFinishedEvent, RunStartedEvent
 from manius_code.core.events.subscribers import EventWriter, StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
@@ -34,23 +34,30 @@ class AgentRunner:
         config: ManiusConfig,
         runs_dir: Path = Path("runs"),
         provider_factory: Callable[[EventBus, list[dict[str, Any]]], AnthropicProvider] | None = None,
+        event_subscribers: list[Subscriber] | None = None,
+        print_events: bool = True,
     ) -> None:
         self._config = config
         self._runs_dir = runs_dir
         self._provider_factory = provider_factory
+        self._event_subscribers = event_subscribers or []
+        self._print_events = print_events
 
     # 创建一次运行的依赖并返回其最终汇总信息。
-    async def run(self, goal: str) -> RunSummary:
+    async def run(self, goal: str, run_id: str | None = None) -> RunSummary:
         # 任务ID
-        run_id = uuid4().hex
+        run_id = run_id or uuid4().hex
         run_dir = self._runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
 
         # 全局事件总线
         event_bus = EventBus()
         writer = EventWriter(run_dir / "events.jsonl")
-        event_bus.subscribe(StdoutPrinter().handle)
+        if self._print_events:
+            event_bus.subscribe(StdoutPrinter().handle)
         event_bus.subscribe(writer.handle)
+        for subscriber in self._event_subscribers:
+            event_bus.subscribe(subscriber)
 
         # 全局状态容器
         context = ExecutionContext(run_id=run_id, goal=goal)
