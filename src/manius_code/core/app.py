@@ -42,7 +42,7 @@ class CoreApp:
             raise RuntimeError("CoreApp configuration is not initialized")
         command = AgentRunCommand.model_validate(params)
         run_id = uuid4().hex
-        runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle])
+        runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle], print_events=False)
         task = asyncio.create_task(runner.run(command.goal, run_id))
         self._agent_tasks.add(task)
         task.add_done_callback(self._record_agent_task_result)

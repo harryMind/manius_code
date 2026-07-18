@@ -35,11 +35,13 @@ class AgentRunner:
         runs_dir: Path = Path("runs"),
         provider_factory: Callable[[EventBus, list[dict[str, Any]]], AnthropicProvider] | None = None,
         event_subscribers: list[Subscriber] | None = None,
+        print_events: bool = True,
     ) -> None:
         self._config = config
         self._runs_dir = runs_dir
         self._provider_factory = provider_factory
         self._event_subscribers = event_subscribers or []
+        self._print_events = print_events
 
     # 创建一次运行的依赖并返回其最终汇总信息。
     async def run(self, goal: str, run_id: str | None = None) -> RunSummary:
@@ -51,7 +53,8 @@ class AgentRunner:
         # 全局事件总线
         event_bus = EventBus()
         writer = EventWriter(run_dir / "events.jsonl")
-        event_bus.subscribe(StdoutPrinter().handle)
+        if self._print_events:
+            event_bus.subscribe(StdoutPrinter().handle)
         event_bus.subscribe(writer.handle)
         for subscriber in self._event_subscribers:
             event_bus.subscribe(subscriber)
