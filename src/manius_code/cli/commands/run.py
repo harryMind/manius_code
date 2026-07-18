@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+from contextlib import suppress
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
@@ -10,7 +12,7 @@ from manius_code.core.bus.commands import AgentRunResult, EventListResult, Event
 from manius_code.core.config import ManiusConfig
 from manius_code.core.bus.events import AgentEvent, RunFinishedEvent
 from manius_code.core.events.subscribers import StdoutPrinter
-from manius_code.core.transport.socket_client import SocketClient
+from manius_code.core.transport.socket_client import IpcError, SocketClient
 
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 
@@ -47,6 +49,7 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
     async def handle_event(message: dict[str, Any]) -> None:
         await consume_event(message)
 
+    # 精确等待指定运行任务的完成事件，忽略其他任务的完成通知。
     async def wait_for_finished(run_id: str) -> RunFinishedEvent:
         while run_id not in finished_events:
             await finished_signal.wait()
@@ -54,8 +57,8 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
         return finished_events[run_id]
 
     client = SocketClient(config.host, config.port, event_handler=handle_event)
-    await client.connect()
     try:
+        await client.connect()
         response = await client.send_command("agent.run", {"type": "agent.run", "goal": goal})
         started = AgentRunResult.model_validate(response.result)
         history = EventListResult.model_validate(
@@ -83,13 +86,22 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
     finally:
         try:
             if sub_id is not None:
-                await client.send_command("event.unsubscribe", {"type": "event.unsubscribe", "sub_id": sub_id})
+                with suppress(IpcError, OSError):
+                    await client.send_command("event.unsubscribe", {"type": "event.unsubscribe", "sub_id": sub_id})
         finally:
-            await client.close()
+            with suppress(OSError):
+                await client.close()
 
 
 # 运行远程 Agent 并以最终事件状态表示命令是否成功完成。
 def run(config: ManiusConfig, goal: str) -> None:
-    finished_event = asyncio.run(_run_remote(config, goal))
+    try:
+        finished_event = asyncio.run(_run_remote(config, goal))
+    except IpcError as error:
+        print(f"manius: IPC request failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+    except (OSError, ValidationError) as error:
+        print(f"manius: unable to run task: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
     if finished_event.status != "success":
         raise SystemExit(1)
