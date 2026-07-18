@@ -23,11 +23,11 @@ _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 _RETRY_DELAY_SECONDS = 2
 _TOKEN_FLUSH_INTERVAL_SECONDS = 0.08
 _MANIUSCODE_LOGO = """\
-M   M   AAA   N   N  IIIII  U   U   SSSS   CCCC   OOO   DDDD   EEEEE
-MM MM  A   A  NN  N    I    U   U  S      C      O   O  D   D  E
-M M M  AAAAA  N N N    I    U   U   SSS   C      O   O  D   D  EEEE
-M   M  A   A  N  NN    I    U   U      S  C      O   O  D   D  E
-M   M  A   A  N   N  IIIII   UUU   SSSS   CCCC   OOO   DDDD   EEEEE"""
+███ ███   ███   ██   ██  █████  ██   ██   ████    █████   ███   ████   █████
+███████  ██ ██  ███  ██    ██   ██   ██  ██      ██      ██ ██  ██  ██  ██
+██ █ ██  █████  ██ █ ██    ██   ██   ██   ███   ██      ██   ██ ████   ████
+██   ██  ██ ██  ██  ███    ██   ██   ██      ██ ██      ██   ██ ██  ██  ██
+██   ██  ██ ██  ██   ██  █████   ███    ████   █████   ██   ██ ████   █████"""
 
 
 # 截断长字段以保持工具调用摘要在窄终端中可读。
@@ -146,7 +146,7 @@ class ManiusTui(App[None]):
     # 挂载 Logo、启动 token 批量刷新定时器和 socket Worker。
     def on_mount(self) -> None:
         banner = Text(_MANIUSCODE_LOGO, style="bold cyan")
-        banner.append("\n  daemon event observer  •  press q to quit", style="dim")
+        banner.append("\n  MANIUSCODE  /  daemon event observer  •  press q to quit", style="dim")
         self._append(Static(banner, id="banner"))
         self._update_header("connecting")
         self.set_interval(_TOKEN_FLUSH_INTERVAL_SECONDS, self._flush_token_buffers)

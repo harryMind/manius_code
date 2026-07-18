@@ -17,7 +17,7 @@ def test_tui_displays_brand_header_and_scrollable_event_view() -> None:
     async def exercise() -> None:
         app = ManiusTui(ManiusConfig(host="127.0.0.1", port=7437))
         async with app.run_test():
-            assert _MANIUSCODE_LOGO.startswith("M   M")
+            assert _MANIUSCODE_LOGO.startswith("███ ███")
             assert app.query_one("#banner", Static) is not None
             assert app.query_one("#header", Static).render() == "maniuscode  127.0.0.1:7437  connecting  global"
             assert app.query_one("#log-view", VerticalScroll) is not None
