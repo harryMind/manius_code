@@ -110,6 +110,7 @@ class SocketServer:
         except ValidationError:
             request_id = raw_request.get("id") if isinstance(raw_request, dict) else None
             return make_error(request_id, INVALID_REQUEST, "Invalid Request")
+        # 匹配对应的处理器
         handler = self._handlers.get(request.method)
         connection_handler = self._connection_handlers.get(request.method)
         if handler is None and connection_handler is None:

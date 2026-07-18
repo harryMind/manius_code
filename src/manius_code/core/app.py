@@ -42,7 +42,7 @@ class CoreApp:
             raise RuntimeError("CoreApp configuration is not initialized")
         command = AgentRunCommand.model_validate(params)
         run_id = uuid4().hex
-        runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle], print_events=False)
+        runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle])
         task = asyncio.create_task(runner.run(command.goal, run_id))
         self._agent_tasks.add(task)
         task.add_done_callback(self._record_agent_task_result)
@@ -71,7 +71,7 @@ class CoreApp:
         self._config = config
         setup_logging(config)
         server = SocketServer(config.host, config.port)
-        # 注册handler
+        # 注册handler以及需要tcp连接的handler
         server.register("core.ping", self._ping_handler)
         server.register_connection_handler("event.subscribe", self._event_subscribe_handler)
         server.register("agent.run", self._agent_run_handler)

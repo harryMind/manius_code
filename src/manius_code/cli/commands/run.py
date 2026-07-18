@@ -29,7 +29,7 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
     finished_events: dict[str, RunFinishedEvent] = {}
     finished_signal = asyncio.Event()
 
-    # 渲染服务端事件，并记录已结束的远程运行。
+    # 渲染服务端事件，并记录已结束的远程运行。 处理服务端推送的event
     async def handle_event(message: dict[str, Any]) -> None:
         if message.get("method") != "event.push" or not isinstance(message.get("params"), dict):
             return
@@ -40,7 +40,7 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
         printer.handle(event)
         if isinstance(event, RunFinishedEvent):
             finished_events[event.run_id] = event
-            finished_signal.set()
+            finished_signal.set() # 唤醒在服务端的await事件
 
     # 等待目标运行的完成事件，并保留其他订阅任务的事件。
     async def wait_for_finished(run_id: str) -> RunFinishedEvent:
