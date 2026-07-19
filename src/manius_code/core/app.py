@@ -16,6 +16,7 @@ from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.logging import setup_logging
 from manius_code.core.transport.socket_server import SocketServer
+from manius_code.core.tracing import TracingProvider
 
 SERVER_VERSION = "0.0.1"
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class CoreApp:
         self._event_broadcaster = IpcEventBroadcaster()
         self._agent_tasks: set[asyncio.Task[Any]] = set()
         self._runs_dir = Path("runs")
+        self._tracer: TracingProvider | None = None
 
     # 处理 ping 命令并返回 daemon 版本和已运行时间。
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -68,7 +70,11 @@ class CoreApp:
         except (ValueError, TypeError) as error:
             task = asyncio.create_task(self._publish_failed_run(run_id, str(error)))
         else:
-            runner = AgentRunner(self._config, event_subscribers=[self._event_broadcaster.handle])
+            runner = AgentRunner(
+                self._config,
+                event_subscribers=[self._event_broadcaster.handle],
+                tracer=self._tracer,
+            )
             task = asyncio.create_task(runner.run(command.goal, run_id))
         self._agent_tasks.add(task)
         task.add_done_callback(self._record_agent_task_result)
@@ -79,7 +85,7 @@ class CoreApp:
         run_dir = self._runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         writer = EventWriter(run_dir / "events.jsonl")
-        event_bus = EventBus()
+        event_bus = EventBus(self._tracer)
         event_bus.subscribe(writer.handle)
         event_bus.subscribe(self._event_broadcaster.handle)
         try:
@@ -119,7 +125,16 @@ class CoreApp:
         config = load_config()
         self._config = config
         setup_logging(config)
-        server = SocketServer(config.host, config.port)
+        if config.trace.enabled:
+            tracer = TracingProvider(config.trace.file, config.trace.max_queue_size)
+            try:
+                await tracer.start()
+            except OSError as error:
+                logger.warning("Tracing is disabled because its file cannot be opened: %s", error)
+            else:
+                self._tracer = tracer
+        self._event_broadcaster = IpcEventBroadcaster(self._tracer)
+        server = SocketServer(config.host, config.port, tracer=self._tracer)
         # 注册handler以及需要tcp连接的handler
         server.register("core.ping", self._ping_handler)
         server.register_connection_handler("event.subscribe", self._event_subscribe_handler)
@@ -128,19 +143,21 @@ class CoreApp:
         server.register("agent.run", self._agent_run_handler)
         server.add_disconnect_handler(self._event_broadcaster.unsubscribe_writer)
 
-        await server.start()
-        stopped = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(signum, stopped.set)
-            except NotImplementedError:
-                pass
         try:
+            await server.start()
+            stopped = asyncio.Event()
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.add_signal_handler(signum, stopped.set)
+                except NotImplementedError:
+                    pass
             await stopped.wait()
         finally:
             await self._stop_agent_tasks()
             await server.stop()
+            if self._tracer is not None:
+                await self._tracer.stop()
             logger.info("manius-core stopped")
 
 

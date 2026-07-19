@@ -18,6 +18,7 @@ from manius_code.core.bus.envelope import (
     JsonRpcSuccess,
     make_error,
 )
+from manius_code.core.tracing import TracingProvider
 
 CommandHandler = Callable[[dict[str, Any]], Awaitable[Any]]
 ConnectionHandler = Callable[[dict[str, Any], asyncio.StreamWriter], Awaitable[Any]]
@@ -27,9 +28,10 @@ logger = logging.getLogger(__name__)
 
 class SocketServer:
     # 保存监听地址、端口和已注册的命令处理器。
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, tracer: TracingProvider | None = None) -> None:
         self._host = host
         self._port = port
+        self._tracer = tracer
         self._server: asyncio.AbstractServer | None = None
         self._handlers: dict[str, CommandHandler] = {}
         self._connection_handlers: dict[str, ConnectionHandler] = {}
@@ -94,6 +96,7 @@ class SocketServer:
     async def _dispatch(self, line: bytes, writer: asyncio.StreamWriter) -> None:
         try:
             response = await self._make_response(line, writer)
+            self._trace_response(response)
             writer.write(response.model_dump_json().encode() + b"\n")
             await writer.drain()
         except (ConnectionError, OSError):
@@ -104,7 +107,9 @@ class SocketServer:
         try:
             raw_request = json.loads(line)
         except json.JSONDecodeError:
+            self._trace_request_parse_error(line)
             return make_error(None, PARSE_ERROR, "Parse error")
+        self._trace_request(raw_request)
         try:
             request = JsonRpcRequest.model_validate(raw_request)
         except ValidationError:
@@ -137,3 +142,42 @@ class SocketServer:
     # 将 Pydantic 返回对象转换为 JSON-RPC 可序列化结果。
     def _serialize_result(self, result: Any) -> Any:
         return result.model_dump() if isinstance(result, BaseModel) else result
+
+    # 记录已成功解析的原始 JSON-RPC 请求并保留请求关联标识。
+    def _trace_request(self, raw_request: Any) -> None:
+        if self._tracer is None:
+            return
+        if isinstance(raw_request, dict):
+            self._tracer.emit(
+                "client_to_core",
+                raw_request,
+                trace_id=self._trace_id(raw_request.get("id")),
+            )
+            return
+        self._tracer.emit("client_to_core", {"raw": raw_request, "error": "Invalid Request"})
+
+    # 记录无法解析的 NDJSON 帧文本与解析错误，便于定位协议兼容问题。
+    def _trace_request_parse_error(self, line: bytes) -> None:
+        if self._tracer is not None:
+            self._tracer.emit(
+                "client_to_core",
+                {"raw": line.decode("utf-8", errors="replace").rstrip("\r\n"), "error": "Parse error"},
+            )
+
+    # 在写入 TCP 连接前记录完整的 JSON-RPC 响应帧。
+    def _trace_response(self, response: JsonRpcSuccess | JsonRpcError) -> None:
+        if self._tracer is None:
+            return
+        payload = response.model_dump(mode="json")
+        result = payload.get("result")
+        run_id = result.get("run_id") if isinstance(result, dict) else None
+        self._tracer.emit(
+            "core_to_client",
+            payload,
+            run_id=run_id if isinstance(run_id, str) else None,
+            trace_id=self._trace_id(response.id),
+        )
+
+    # 将 JSON-RPC 标识标准化为追踪记录使用的可选字符串。
+    def _trace_id(self, value: int | str | None) -> str | None:
+        return str(value) if value is not None else None

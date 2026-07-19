@@ -15,3 +15,20 @@ def test_load_config_uses_documented_precedence(tmp_path: Path) -> None:
     )
     assert config.host == "10.0.0.3"
     assert config.port == 7001
+
+
+# 功能：验证全局追踪的开关、文件路径和队列容量可通过环境变量配置。
+# 设计：直接提供三项 MANIUS_TRACE 前缀变量，覆盖配置映射和 Pydantic 类型转换两个边界。
+def test_load_config_maps_trace_environment_values(tmp_path: Path) -> None:
+    trace_path = tmp_path / "custom-trace.jsonl"
+    config = load_config(
+        tmp_path,
+        {
+            "MANIUS_TRACE_ENABLED": "false",
+            "MANIUS_TRACE_FILE": str(trace_path),
+            "MANIUS_TRACE_MAX_QUEUE_SIZE": "32",
+        },
+    )
+    assert config.trace.enabled is False
+    assert config.trace.file == trace_path
+    assert config.trace.max_queue_size == 32
