@@ -13,6 +13,7 @@ from manius_code.core.events.bus import EventBus, Subscriber
 from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.tracing import TracingProvider
 from manius_code.core.tools.invocation import ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
 from manius_code.core.tools.registry import ToolRegistry
@@ -35,11 +36,13 @@ class AgentRunner:
         runs_dir: Path = Path("runs"),
         provider_factory: Callable[[EventBus, list[dict[str, Any]]], AnthropicProvider] | None = None,
         event_subscribers: list[Subscriber] | None = None,
+        tracer: TracingProvider | None = None,
     ) -> None:
         self._config = config
         self._runs_dir = runs_dir
         self._provider_factory = provider_factory
         self._event_subscribers = event_subscribers or []
+        self._tracer = tracer
 
     # 创建一次运行的依赖并返回其最终汇总信息。
     async def run(self, goal: str, run_id: str | None = None) -> RunSummary:
@@ -49,7 +52,7 @@ class AgentRunner:
         run_dir.mkdir(parents=True, exist_ok=False)
 
         # 全局事件总线
-        event_bus = EventBus()
+        event_bus = EventBus(self._tracer)
         writer = EventWriter(run_dir / "events.jsonl")
 
         # 其实daemon端不用注册终端输出事件，因为在事件推送中会回调hand_event函数执行printer.handle
@@ -130,4 +133,4 @@ class AgentRunner:
     def _make_provider(self, event_bus: EventBus, tools: ToolRegistry) -> AnthropicProvider:
         if self._provider_factory:
             return self._provider_factory(event_bus, tools.definitions())
-        return AnthropicProvider(self._config.llm, event_bus, tools.definitions())
+        return AnthropicProvider(self._config.llm, event_bus, tools.definitions(), tracer=self._tracer)

@@ -5,6 +5,7 @@ from fnmatch import fnmatchcase
 from uuid import uuid4
 
 from manius_code.core.bus.events import AgentEvent, EventPushEnvelope
+from manius_code.core.tracing import TracingProvider
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,10 @@ class EventSubscription:
 
 class IpcEventBroadcaster:
     # 初始化订阅记录与待完成推送任务的集合。
-    def __init__(self) -> None:
+    def __init__(self, tracer: TracingProvider | None = None) -> None:
         self._subscriptions: dict[str, EventSubscription] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._tracer = tracer
 
     # 创建带运行范围和 topic 规则的事件订阅并返回订阅标识。
     def subscribe(self, writer: asyncio.StreamWriter, run_id: str | None = None, topics: list[str] | None = None) -> str:
@@ -60,7 +62,14 @@ class IpcEventBroadcaster:
     # 以标准 JSON-RPC 通知信封向订阅连接推送事件。
     async def _send(self, subscription: EventSubscription, event: AgentEvent) -> None:
         try:
-            subscription.writer.write(EventPushEnvelope(params=event).model_dump_json().encode() + b"\n")
+            envelope = EventPushEnvelope(params=event)
+            if self._tracer is not None:
+                self._tracer.emit(
+                    "core_to_client",
+                    envelope.model_dump(mode="json"),
+                    run_id=event.run_id,
+                )
+            subscription.writer.write(envelope.model_dump_json().encode() + b"\n")
             await subscription.writer.drain()
         except (ConnectionError, OSError, RuntimeError):
             logger.debug("Removing disconnected event subscriber")

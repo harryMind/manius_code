@@ -26,6 +26,12 @@ class LlmConfig(BaseModel):
     default_base_url: str | None = None
 
 
+class TraceConfig(BaseModel):
+    enabled: bool = True
+    file: Path = Field(default_factory=lambda: Path.home() / ".manius" / "traces" / "daemon.jsonl")
+    max_queue_size: int = Field(default=10_000, ge=1)
+
+
 class ManiusConfig(BaseModel):
     # IPC服务基础
     host: str = Field(default="127.0.0.1")
@@ -34,6 +40,7 @@ class ManiusConfig(BaseModel):
     # 日志配置
     log: LogConfig = Field(default_factory=LogConfig)
     llm: LlmConfig = Field(default_factory=LlmConfig)
+    trace: TraceConfig = Field(default_factory=TraceConfig)
     max_steps: int = Field(default=20, ge=1)
 
 
@@ -57,10 +64,11 @@ def _read_dotenv(path: Path) -> dict[str, str]:
 
 
 # 将带 MANIUS_ 前缀的环境变量映射为内部配置键。
-def _environment_values(values: dict[str, str]) -> dict[str, str]:
+def _environment_values(values: dict[str, str]) -> dict[str, object]:
     prefix = "MANIUS_"
     mapped: dict[str, object] = {}
     llm_values: dict[str, str] = {}
+    trace_values: dict[str, str] = {}
     for key, value in values.items():
         uppercase_key = key.upper()
         if uppercase_key == "ANTHROPIC_API_KEY":
@@ -69,10 +77,14 @@ def _environment_values(values: dict[str, str]) -> dict[str, str]:
             config_key = key[len(prefix) :].lower()
             if config_key.startswith("llm_"):
                 llm_values[config_key.removeprefix("llm_")] = value
+            elif config_key.startswith("trace_"):
+                trace_values[config_key.removeprefix("trace_")] = value
             else:
                 mapped[config_key] = value
     if llm_values:
         mapped["llm"] = llm_values
+    if trace_values:
+        mapped["trace"] = trace_values
     return mapped
 
 
