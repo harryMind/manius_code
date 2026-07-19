@@ -1,132 +1,122 @@
-# manius_development_plan.md
+# ManiusCode 开发计划（S0–S2 实现校准版）
 
-this is the detail plan of the manius_code, a local agent system, including s0 ~ s7 8 stages.
+本文档记录仓库当前已经落地的 S0–S2 功能，而不是早期的预期设计。当前可执行架构为：`manius-core` 是唯一的 Agent 执行进程，`manius` 是一次性 CLI 客户端，`manius-tui` 是常驻只读观测客户端。
 
-## s0
+```text
+manius-core (daemon, TCP 127.0.0.1:7437)
+  ├─ JSON-RPC 2.0 / NDJSON
+  ├─ AgentRunner、事件持久化和 IPC 广播
+  └─ runs/<run_id>/events.jsonl
 
-build two process: manius-core and manius. make they Perform process communication.After the user types "manius ping", CLI reads the configuration, connects to 127.0.0.1:7437, and sends out A single JSON-RPC request; the daemon reads this line using readline(), verifies it as a protocol model, and dispatches it to core.ping handler, and then write PongResult back. We will build the system station by station along this path.
+manius (CLI)       ─┐
+manius-tui (TUI)   ─┴─ SocketClient / JSON-RPC
+```
 
-manius-core live in: ..\src\manius_code\core
-manius live in: ..\src\manius_code\cli
+## S0：双进程 IPC 基座（已完成）
 
-the final effect: I will open two terminal
+### 目标
+
+建立常驻 `manius-core` daemon 与 `manius` CLI 的 TCP JSON-RPC 通信链路，并以 `core.ping` 验证配置加载、请求分发和响应匹配。
+
+### 已完成内容
+
+- `ManiusConfig` 支持默认值、`~/.manius/config.toml`、项目 `.env` 和环境变量的分层加载。
+- `SocketServer` 使用 `asyncio.start_server` 提供 TCP NDJSON 服务，支持 JSON-RPC 解析、参数校验、方法不存在和内部错误响应；同一连接上的请求可并发分发。
+- `SocketClient` 以 UUID 请求 ID 匹配并发 RPC 响应，统一处理连接关闭和协议错误。
+- daemon 注册 `core.ping`，返回版本号与运行时长；CLI 提供 `manius ping`。
+- 项目入口已注册：`manius-core`、`manius` 和后续 S2 增加的 `manius-tui`。
+
+### 验收
+
 ```bash
-# terminal A
+# 终端 A
 uv run manius-core
 
-# terminal B
+# 终端 B
 uv run manius ping
 ```
-then output: 
+
+`tests/integration/test_ping.py` 覆盖真实 daemon 的 ping 链路以及同一长连接上的并发 ping 响应匹配。
+
+## S1：Agent 执行内核与事件持久化（已完成）
+
+### 目标
+
+实现可由上层宿主复用的 Agent 执行链路：Plan → Act → Observe，具备结构化事件、工具调用、Claude 流式输出和每次运行的事件持久化。
+
+### 已完成内容
+
+- `ExecutionContext` 保存 `run_id`、目标、步骤、对话历史以及全局三态：`running`、`success`、`failed`；通过 `mark_success()`、`mark_failed()` 和 `is_done()` 统一控制状态流转。
+- `AgentLoop` 在最大步数内驱动 Claude、工具调用和上下文追加；正常结束、异常和步数超限均写入上下文状态。
+- `AgentRunner` 为每个运行创建 `runs/<run_id>/events.jsonl`，装配 `EventBus`、`EventWriter`、工具注册表、工具调用器、LLM Provider 与 AgentLoop，并返回 `RunSummary`。
+- 事件模型统一位于 `core.bus.events`，包括运行、步骤、工具、LLM 请求、LLM token 与 LLM 响应事件；每个 Agent 事件携带 `kind="event"`、`run_id`、时间戳和步骤信息。
+- 工具职责已拆分：`ToolRegistry` 仅负责注册和查询；`ToolInvoker` 负责执行、错误转换与 `tool_call_start/success/failed` 事件广播。当前实现的业务工具为 `ReadFileTool`。
+- `AnthropicProvider` 使用 `AsyncAnthropic.messages.stream()` 输出 `LlmTokenEvent`，并在请求中设置 `cache_control={"type": "ephemeral"}`；最终结果以 `LlmResponseEvent` 广播。
+- `StdoutPrinter` 和 `EventWriter` 保持为事件订阅者。当前 daemon 不订阅 `StdoutPrinter`，避免服务端与客户端重复打印。
+
+### 当前边界
+
+S1 形成的 Agent 内核仍保持独立、可注入和可测试；但当前 `manius run` 的实际入口已在 S2 改为远程调用 daemon，不再以 CLI 前台进程直接实例化 `AgentRunner`。
+
+## S2：Daemon 执行、事件流与客户端观测（已完成）
+
+### 目标
+
+将 Agent 执行权收敛到 `manius-core`，让 CLI 与 TUI 通过同一套 SocketClient 和 JSON-RPC 协议启动、追踪和观测任务。
+
+### Daemon 实现
+
+- `CoreApp` 注册 `core.ping`、`agent.run`、`event.subscribe`、`event.unsubscribe` 和 `event.list`。
+- `agent.run` 立即返回 `AgentRunResult(run_id)`，后台以 `asyncio.Task` 执行 `AgentRunner`；daemon 停止时会取消并等待仍在运行的任务。
+- 任务参数错误也会分配 `run_id`，持久化并广播 `run_started` 与 `run_finished(status="failed", reason=...)`，使客户端可统一通过事件流获知终态。
+- `IpcEventBroadcaster` 作为 `EventBus` 订阅者，以非阻塞 task 向匹配订阅推送事件；断开连接会自动清理订阅。
+- 推送不再发送裸事件 JSON，而是标准 JSON-RPC 通知信封：
+
+  ```json
+  {"jsonrpc":"2.0","method":"event.push","params":{"kind":"event", "type":"..."}}
+  ```
+
+- `event.subscribe` 返回唯一 `sub_id`，支持 `run_id` 精确隔离或 `run_id=null` 全局观测，并支持 `topics` 的简单通配符过滤，例如 `step_*`、`tool_*`、`["*"]`。
+- `event.unsubscribe(sub_id)` 可在不断开 TCP 的情况下主动释放订阅。
+- `event.list(run_id)` 从 `runs/<run_id>/events.jsonl` 返回历史事件，用于快速任务和重连后的回放。
+
+### CLI 实现
+
+`manius run --goal "..."` 使用以下防丢事件时序：
+
+1. 调用 `agent.run` 并立即获得 `run_id`。
+2. 第一次调用 `event.list(run_id)`，渲染已持久化的历史事件。
+3. 若已得到对应的 `RunFinishedEvent`，直接返回。
+4. 调用 `event.subscribe(run_id, topics=["*"])` 建立精准实时订阅。
+5. 第二次调用 `event.list(run_id)`，仅补齐内部完成状态，不重复打印。
+6. 仅等待目标 `run_id` 的 `RunFinishedEvent`；在 `finally` 中主动退订并关闭连接。
+
+连接、IPC 和响应校验失败会显示清晰错误信息并以非零退出码结束。
+
+### TUI 实现
+
+- `manius-tui` 是常驻只读观测端，使用 Textual `run_worker` 管理自动重连循环，并且每次重连都创建新的 `SocketClient`。
+- 默认采用全局订阅：`run_id=null`、`topics=["*"]`；顶部状态栏显示 daemon 地址与连接状态。
+- 使用 `VerticalScroll` 管理层级事件组件：运行、步骤、工具和结束事件是独立块；工具块会原地从 `running` 更新为 `done` 或 `failed`。
+- LLM token 仅作为结果文本的传输数据：按短时间窗口批量写入同一个 `LlmStreamBlock`，流结束后升级为 Markdown 渲染，不输出原始 TokenEvent 日志行。
+- TUI 包含 ManiusCode 块字符 Banner；按 `q` 退出时取消 Worker，由其清理逻辑退订并关闭连接。
+
+### 验收
+
 ```bash
-pong server=0.0.1 uptime=*mx latency=*ms
+uv sync
+
+# 终端 A：daemon
+uv run manius-core
+
+# 终端 B：常驻观测（先启动，查看后续产生的全局事件）
+uv run manius-tui
+
+# 终端 C：启动一次 Agent 运行
+uv run manius run --goal "请帮我总结 README.md 文件内容"
+
+# 自动化测试
+uv run pytest tests/unit tests/integration -q
 ```
 
-## s1
-
-The current project is in the S1 development stage, and the S0 base has been completed, including configuration loading, logging system, TCP JSON-RPC SocketServer/SocketClient persistent connection communication framework, and basic CLI parsing framework.
-S1 Core Objective: Implement the first end-to-end Agent operation pipeline, supporting the command: `uv run manius run --goal "summarize main sections of README.md"`
-After running, two types of outputs will be achieved:
-1. The terminal prints logs of Agent's thinking, planning, tool invocation, and step flow in real time (refer to the document for sample format);
-2. Persist the full event records in runs/{run_id}/events.jsonl, saving all LLM interactions, tool invocations, and timing information.
-
-### Required component checklist
-
-1. CLI layer: Add a new run sub-command to parse the --goal parameter, serving as the entry point for the entire pipeline;
-2. AgentRunner: Top-level assembly entry
- - Generate a unique run_id; automatically create a storage directory named "runs/{run_id}";
- - Initialize the EventBus; attach the subscribers StdoutPrinter and EventWriter;
- - Initialize the Context and AgentLoop, and inject all dependencies;
- - Responsible for initiating and closing tasks, and outputting the final summary statistics (total steps, total time consumed).
-3. ExecutionContext: Global state container
- - Save the run metadata and initial task goal;
- - Maintain a complete history of multiple rounds of dialogues, with continuous appending of tool results and LLM responses for each round;
- - Record the current step number.
-4. AgentLoop: The core driving loop, following the plan → act → observe loop paradigm
- - Repeat the process of planning, tool execution, and result observation;
- - Determine the termination condition: Exit the loop when the LLM indicates task completion;
- - Increment the step for each round of iteration; send events out in all stages.
-5. LLM component AnthropicProvider
- Encapsulate LLM API calls; receive conversation context, initiate requests, and return structured responses; push events throughout the entire LLM interaction process.
-6. Tool system
- ToolRegistry: Unified tool registration and retrieval;
- ReadFileTool: The only implementation tool, which reads local text files; 
- Specific tools Architecture: Each tool should have error messages that correspond to the execution errors of the tool. Furthermore, the specific execution of the tool needs to be decoupled from the broadcast event. Only the unified interface for tool invocation, wrapped by the broadcast event, should be exposed externally;
-7. Event observation system (based on EventBus publish-subscribe)
- EventBus: Global Broadcast Center;
- StdoutPrinter: Subscribe to events and format output for human-readable terminal logs;
- EventWriter: Subscribe to events and persistently serialize the events into events.jsonl.
-
-### Mandatory development constraints
-
-There are only three packages (cli, core, tui) in the manius_code directory, and all the core functions in s1 are implemented in the core package.
-
-1. Simplified architecture in S1 phase: manius run runs the Agent as an independent foreground process, **temporarily not using daemon IPC communication**. The SocketServer/SocketClient persistent connection components are retained but not integrated into the business in this round; IPC integration will be addressed in S2;
-2. The tool only implements ReadFileTool and does not add any other tools;
-3. LLM only implements Anthropic Claude docking, and does not design a multi-model abstraction layer for the time being;
-4. Strict layering: The business agent logic, tools, LLM, and event observation are decoupled from each other, with dependencies injected through constructor functions;
-5. All behaviors should not be hard-coded with print statements; **all outputs and logs must be broadcasted through the EventBus**; terminal printing and file persistence are uniformly implemented based on event subscriptions;
-6. Define standard event data model: run_started / run_finished / step_planning / step_done / tool_call_start / tool_call_success / tool_call_failed;
-7. The code adopts the asyncio asynchronous paradigm, utilizes pydantic for unified data validation, and follows standardized type annotations;
-8. It is prohibited to implement S2 functions ahead of schedule: task background hosting, IPC remote calls, additional tools, web interface, and retry strategy.
-
-Output delivery requirements:
-1. Split the complete source code by modules, following a hierarchical directory structure;
-2. Accompanying component dependency description;
-3. Provide an example of the startup test command;
-4. The relevant configurations for LLM have been filled in the .env file
-
-## s2
-
-### Engineering background
-The current project has completed Phase S1: under a single process, 'manius run -- goal' can run an end-to-end Agent loop, including LLM calls, tool execution, event bus, terminal real-time printing, and events.json persistence for the entire chain.
-We are now entering the S2 phase for architecture upgrade: we will migrate AgentRunner to the manius core daemon, convert CLI to a pure client, and remotely schedule tasks and subscribe to event streams through TCP JSON-RPC.
-
-### Reusable assets (interfaces are strictly prohibited from modification and can be reused directly)
-1. Core operating layer: Agentloop, ExecutionContext, ToolInvoke, AnthropicProvider, with completely unchanged interfaces and logic
-2. Event system: All event models (AgentEvent family) EventBus、EventWriter、StdoutPrinter， The interface and rendering logic remain completely unchanged
-3. IPC base: SocketServer, JSON-RPC 2.0 protocol architecture SocketClient， The existing ping interface is available
-4. Persistence: The logic for writing events.json remains unchanged
-
-##Core Objectives of S2 Stage
-1. Make the manius core daemon the only agent execution carrier, and the CLI will no longer directly run AgentRunner
-2. The event bus has added IPC broadcasting capability, and all running events can be pushed to subscription clients through sockets
-3. Change the 'manius run' command of CLI to remote call mode: subscribe to events → initiate tasks → real-time consumption of event stream printing
-4. Support multiple clients to subscribe to the same task event stream simultaneously
-
-### Specific Renovation Task List
-1. Daemon side adds IpcEventBroadcaster component
--As a subscriber of EventBus, receive all AgentEvents
--Serialize events into JSON line format and push them to all subscribed client connections through sockets
--Support concurrent subscriptions from multiple clients, automatic clearing of connection disconnections, and non blocking of event bus main processes
--The event push format is completely consistent with the existing event model fields, and the client can directly deserialize and reuse the StdoutPrinter
-
-2. Daemon side SocketServer adds RPC method
--Add 'event. subscribe': After being called by the client, add the current connection to the event broadcast list and continuously push all subsequent running events
--Add 'agent. run': Receive goal parameter, instantiate AgentRunner and start task, synchronously return task start result
--All RPC strictly follow the existing JSON-RPC 2.0 protocol specifications and are consistent with the ping interface style
-
-3. Daemon side AgentRunner access
--Maintain the AgentRunner lifecycle within the daemon process and reuse the S1 complete running link during task execution
--All events generated during task execution are connected to the local EventBus and distributed to EventWriter (persistence) and IpcEventBroadcaster (remote push) simultaneously
-
-4. CLI side run command transformation
--Remove the logic of directly instantiating AgentRunner
--Establish a socket connection to the daemon and perform the following steps in sequence:
-1. Call 'event. subscribe' RPC to subscribe to the event stream
-2. The backend starts the coroutine to continuously read socket push events, deserializes them, and feeds them to the StdoudPrinter for real-time printing
-3. Call 'agent. run' RPC to initiate the task
--After the task is completed and the event stream push is finished, clear the connection and exit
-
-### Strict constraints
-1. It is prohibited to modify the external interfaces of S1's existing core modules, including but not limited to Agentloop, ExecutionContext, event model, etc EventBus、StdoutPrinter、ToolInvoker
-2. All newly added logic must not disrupt the single process running capability of S1, and the local direct running mode remains optional
-3. The event push protocol is completely aligned with the local event model fields, and the client can reuse the StdoutPrinter without adding parsing logic
-4. IPC broadcasting must not block the main process of the event bus. Abnormal connections must be gracefully downgraded without affecting local task execution and persistence
-
-### Delivery requirements
-1. Output the complete IpcEventBroadcaster implementation code
-2. Output the processing logic for adding two RPC methods to SocketServer
-3. Output the complete entry code modified with the CLI run command
-4. Explain the responsibilities of each newly added code and its calling relationship with existing modules
-5. Verification criteria: After starting the daemon, the CLI can execute 'manius run -- goal' to trigger tasks normally, the terminal can print events in real time, and events.json can be written normally, which is consistent with the single process effect of S1
+当前测试覆盖 S0 ping、S1 Agent/工具/LLM 流式与状态机，以及 S2 的异步 `agent.run`、事件信封、run_id/topic 订阅隔离、退订、历史回放、CLI 时序和 TUI 事件组件流。
