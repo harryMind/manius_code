@@ -51,10 +51,30 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
 
     # 精确等待指定运行任务的完成事件，忽略其他任务的完成通知。
     async def wait_for_finished(run_id: str) -> RunFinishedEvent:
-        while run_id not in finished_events:
-            await finished_signal.wait()
+        while True:
+            if run_id in finished_events:
+                return finished_events[run_id]
+            event_loop_task = client._event_loop_task
+            if event_loop_task is None:
+                raise IpcError(-32000, "Event stream is not running")
+            signal_waiter = asyncio.create_task(finished_signal.wait())
+            done, _ = await asyncio.wait(
+                {signal_waiter, event_loop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if signal_waiter not in done:
+                signal_waiter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await signal_waiter
+            if run_id in finished_events:
+                return finished_events[run_id]
+            if event_loop_task in done:
+                if event_loop_task.cancelled():
+                    raise IpcError(-32000, "Event stream was cancelled before run finished")
+                error = event_loop_task.exception()
+                detail = f": {error}" if error is not None else ""
+                raise IpcError(-32000, f"Event stream closed before run finished{detail}")
             finished_signal.clear()
-        return finished_events[run_id]
 
     client = SocketClient(config.host, config.port, event_handler=handle_event)
     try:
@@ -85,11 +105,12 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
         return await wait_for_finished(started.run_id)
     finally:
         try:
-            if sub_id is not None:
+            event_loop_task = client._event_loop_task
+            if sub_id is not None and event_loop_task is not None and not event_loop_task.done():
                 with suppress(IpcError, OSError):
                     await client.send_command("event.unsubscribe", {"type": "event.unsubscribe", "sub_id": sub_id})
         finally:
-            with suppress(OSError):
+            with suppress(IpcError, OSError, RuntimeError, ValueError):
                 await client.close()
 
 

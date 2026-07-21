@@ -14,6 +14,7 @@ from manius_code.core.bus.events import EventPushEnvelope
 
 logger = logging.getLogger(__name__)
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+_MAX_IPC_FRAME_BYTES = 64 * 1024 * 1024
 
 
 class IpcError(RuntimeError):
@@ -39,7 +40,11 @@ class SocketClient:
     async def connect(self) -> None:
         if self._writer is not None:
             raise RuntimeError("SocketClient is already connected")
-        self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
+        self._reader, self._writer = await asyncio.open_connection(
+            self._host,
+            self._port,
+            limit=_MAX_IPC_FRAME_BYTES,
+        )
         self._event_loop_task = asyncio.create_task(self.run_event_loop())
 
     # 关闭连接、停止读取循环并通知所有等待中的请求。
@@ -62,6 +67,8 @@ class SocketClient:
     async def send_command(self, method: str, params: dict[str, Any]) -> JsonRpcSuccess:
         if self._writer is None:
             raise RuntimeError("SocketClient is not connected")
+        if self._event_loop_task is None or self._event_loop_task.done():
+            raise IpcError(-32000, "SocketClient connection closed")
         request_id = str(uuid4())
         future: asyncio.Future[JsonRpcSuccess] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
