@@ -10,7 +10,7 @@ All package import rules: `from manius_code.包.**`, Install manius_code in edit
 
 If you think there is a lack of fine-grained task details, feel free to ask me questions until you are 95% confident in understanding and executing the task.
 
-After each conversation output, a description statement for the git commit is required.
+After each conversation output, a description statement for the git commit is required. please use chinese following the common types
 ### Common types
 1. **fix**: Fix bugs (preferred in your current scenario)
 2. **feat**: New feature
@@ -21,8 +21,8 @@ After each conversation output, a description statement for the git commit is re
 7. **chore**: miscellaneous tasks related to building, dependencies, and scripts
 For example:
 ```bash
-git commit -m "fix: Fixed xxx logic exception"
-git commit -m "fix: resolve error issue in xx module"
+git commit -m "fix: 修复****异常"
+git commit -m "fix: 解决**模块BUG"
 git commit -m "fix: optimize exception handling logic"
 git commit -m "fix: Fixed parameter parsing bug"
 ```
