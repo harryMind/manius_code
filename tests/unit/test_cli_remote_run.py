@@ -5,15 +5,15 @@ import pytest
 
 from manius_code.cli.commands.run import _run_remote, run
 from manius_code.core.bus.commands import AgentRunResult, EventListResult, EventSubscribeResult, EventUnsubscribeResult
-from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
+from manius_code.core.bus.events import LlmRequestEvent, RunFinishedEvent, RunStartedEvent
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.transport.socket_client import IpcError
 from manius_code.core.transport.socket_server import SocketServer
 
 
-# 功能：验证 CLI 以 run_id 回放历史、订阅实时事件并通过完成事件结束远程运行。
-# 设计：模拟 agent.run 立即返回、后续异步广播完成事件，覆盖任务 ID 闭环和订阅竞态。
+# 功能：验证 CLI 可接收超过默认读取上限的事件，随后通过完成事件结束远程运行。
+# 设计：模拟大尺寸 llm_request 与异步完成推送，覆盖 IPC 帧大小、历史回放和订阅等待的组合边界。
 def test_cli_remote_run_replays_history_and_consumes_scoped_completion_event(free_port: int) -> None:
     # 驱动模拟 daemon 与 CLI 客户端完成一次异步远程运行。
     async def exercise() -> RunFinishedEvent:
@@ -44,6 +44,13 @@ def test_cli_remote_run_replays_history_and_consumes_scoped_completion_event(fre
 
             async def finish() -> None:
                 await asyncio.sleep(0.01)
+                request = LlmRequestEvent(
+                    run_id=run_id,
+                    step=1,
+                    messages=[{"role": "user", "content": "x" * 100_000}],
+                )
+                history[run_id].append(request.model_dump(mode="json"))
+                broadcaster.handle(request)
                 completed = RunFinishedEvent(run_id=run_id, status="success", total_steps=1, duration_ms=1, summary="done")
                 history[run_id].append(completed.model_dump(mode="json"))
                 broadcaster.handle(completed)
@@ -58,7 +65,7 @@ def test_cli_remote_run_replays_history_and_consumes_scoped_completion_event(fre
         server.add_disconnect_handler(broadcaster.unsubscribe_writer)
         await server.start()
         try:
-            return await _run_remote(ManiusConfig(port=free_port), "remote goal")
+            return await asyncio.wait_for(_run_remote(ManiusConfig(port=free_port), "remote goal"), timeout=2)
         finally:
             await server.stop()
 
@@ -80,3 +87,46 @@ def test_cli_run_reports_ipc_errors_without_traceback(monkeypatch: pytest.Monkey
 
     assert error.value.code == 1
     assert capsys.readouterr().err == "manius: IPC request failed: [-32601] Method not found\n"
+
+
+# 功能：验证事件流在任务完成前断开时，CLI 会退出并报告 IPC 错误而非永久等待。
+# 设计：真实服务端在建立订阅后主动关闭连接，直接覆盖完成信号永远不会到达的等待边界。
+def test_cli_remote_run_fails_when_event_stream_closes_before_completion(free_port: int) -> None:
+    # 构造订阅成功后立即断开的 daemon 替身。
+    async def exercise() -> None:
+        server = SocketServer("127.0.0.1", free_port)
+
+        # 返回待观察任务的固定运行标识。
+        async def run_agent(params: dict[str, Any]) -> AgentRunResult:
+            return AgentRunResult(run_id="closing-run")
+
+        # 返回尚无完成事件的空历史记录。
+        async def list_events(params: dict[str, Any]) -> dict[str, Any]:
+            return EventListResult(run_id=params["run_id"], events=[]).model_dump()
+
+        # 确认订阅后关闭当前连接，模拟中断的事件流。
+        async def subscribe(params: dict[str, Any], writer: asyncio.StreamWriter) -> dict[str, Any]:
+            # 延迟关闭写入端以确保订阅响应先被客户端接收。
+            async def close_connection() -> None:
+                await asyncio.sleep(0.01)
+                writer.close()
+                await writer.wait_closed()
+
+            asyncio.create_task(close_connection())
+            return EventSubscribeResult(
+                sub_id="closing-subscription",
+                run_id=params["run_id"],
+                topics=params["topics"],
+            ).model_dump()
+
+        server.register("agent.run", run_agent)
+        server.register("event.list", list_events)
+        server.register_connection_handler("event.subscribe", subscribe)
+        await server.start()
+        try:
+            with pytest.raises(IpcError, match="Event stream closed before run finished"):
+                await asyncio.wait_for(_run_remote(ManiusConfig(port=free_port), "remote goal"), timeout=2)
+        finally:
+            await server.stop()
+
+    asyncio.run(exercise())

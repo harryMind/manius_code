@@ -30,6 +30,8 @@ class TraceConfig(BaseModel):
     enabled: bool = True
     file: Path = Field(default_factory=lambda: Path.home() / ".manius" / "traces" / "daemon.jsonl")
     max_queue_size: int = Field(default=10_000, ge=1)
+    max_size_mb: int = Field(default=10, ge=1)
+    backup_count: int = Field(default=5, ge=0)
 
 
 class ManiusConfig(BaseModel):

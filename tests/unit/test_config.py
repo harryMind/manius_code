@@ -17,8 +17,8 @@ def test_load_config_uses_documented_precedence(tmp_path: Path) -> None:
     assert config.port == 7001
 
 
-# 功能：验证全局追踪的开关、文件路径和队列容量可通过环境变量配置。
-# 设计：直接提供三项 MANIUS_TRACE 前缀变量，覆盖配置映射和 Pydantic 类型转换两个边界。
+# 功能：验证全局追踪的开关、文件路径、队列容量和轮转策略可通过环境变量配置。
+# 设计：直接提供全部 MANIUS_TRACE 前缀变量，覆盖嵌套配置映射和 Pydantic 数值转换边界。
 def test_load_config_maps_trace_environment_values(tmp_path: Path) -> None:
     trace_path = tmp_path / "custom-trace.jsonl"
     config = load_config(
@@ -27,8 +27,12 @@ def test_load_config_maps_trace_environment_values(tmp_path: Path) -> None:
             "MANIUS_TRACE_ENABLED": "false",
             "MANIUS_TRACE_FILE": str(trace_path),
             "MANIUS_TRACE_MAX_QUEUE_SIZE": "32",
+            "MANIUS_TRACE_MAX_SIZE_MB": "12",
+            "MANIUS_TRACE_BACKUP_COUNT": "3",
         },
     )
     assert config.trace.enabled is False
     assert config.trace.file == trace_path
     assert config.trace.max_queue_size == 32
+    assert config.trace.max_size_mb == 12
+    assert config.trace.backup_count == 3

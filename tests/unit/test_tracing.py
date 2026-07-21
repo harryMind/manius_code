@@ -10,7 +10,7 @@ from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.llm.anthropic import AnthropicProvider
-from manius_code.core.tracing import TracingProvider
+from manius_code.core.tracing import TracingProvider, trace_paths
 from manius_code.core.transport.socket_client import SocketClient
 from manius_code.core.transport.socket_server import SocketServer
 from tests.unit.test_anthropic_provider import FakeClient
@@ -36,6 +36,37 @@ def test_tracing_provider_drains_global_file_on_stop(tmp_path: Path) -> None:
     assert records[1]["run_id"] == "run-1"
     assert records[1]["step"] == 0
     assert re.fullmatch(r".+\+00:00", records[0]["ts"])
+
+
+# 功能：验证追踪文件按大小轮转、索引归档元数据，并清理超过保留数量的旧文件。
+# 设计：逐批排空队列以稳定触发两次轮转，断言索引、活动文件和唯一保留归档的记录顺序。
+def test_tracing_provider_rotates_files_and_maintains_archive_index(tmp_path: Path) -> None:
+    # 写入三批超过 1MB 总阈值的记录以生成两个归档。
+    async def exercise() -> tuple[Path, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[Path]]:
+        trace_path = tmp_path / "traces" / "daemon.jsonl"
+        tracer = TracingProvider(trace_path, max_size_mb=1, backup_count=1)
+        await tracer.start()
+        for kind in ("first", "second", "third"):
+            tracer.emit("CORE", "event", kind, {"payload": "x" * 600_000})
+            await tracer._queue.join()
+        await tracer.stop()
+        index = json.loads((tmp_path / "traces" / "daemon.index.json").read_text(encoding="utf-8"))
+        archive_path = trace_path.parent / index["files"][0]["file"]
+        active_records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+        archive_records = [json.loads(line) for line in archive_path.read_text(encoding="utf-8").splitlines()]
+        return trace_path, index, active_records, archive_records, trace_paths(trace_path)
+
+    trace_path, index, active_records, archive_records, paths = asyncio.run(exercise())
+    assert index["version"] == 1
+    assert len(index["files"]) == 1
+    assert index["files"][0]["record_count"] == 1
+    assert index["files"][0]["first_ts"]
+    assert index["files"][0]["last_ts"]
+    assert index["files"][0]["size_bytes"] > 0
+    assert [record["kind"] for record in archive_records] == ["second"]
+    assert [record["kind"] for record in active_records] == ["third"]
+    assert paths[-1] == trace_path
+    assert len(paths) == 2
 
 
 # 功能：验证 SocketServer 对正常请求、损坏帧及对应响应均写入完整 IPC 追踪记录。

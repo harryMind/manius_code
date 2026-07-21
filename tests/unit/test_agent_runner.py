@@ -34,6 +34,112 @@ class FailingAnthropicProvider:
         raise RuntimeError("Provider request failed")
 
 
+class RecoveringAnthropicProvider:
+    # 初始化调用计数并保留第二轮收到的工具观察结果。
+    def __init__(self) -> None:
+        self._calls = 0
+        self.messages_after_failure: list[dict] = []
+
+    # 先请求不存在的文件，再根据失败观察返回最终答案。
+    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
+        self._calls += 1
+        if self._calls == 1:
+            return LlmResponse(
+                text="I will inspect the old event model path.",
+                tool_calls=[
+                    ToolCall(
+                        id="missing-read-1",
+                        name="read_file",
+                        arguments={"path": "src/manius_code/core/events/models.py"},
+                    )
+                ],
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "id": "missing-read-1",
+                        "name": "read_file",
+                        "input": {"path": "src/manius_code/core/events/models.py"},
+                    }
+                ],
+            )
+        self.messages_after_failure = messages
+        return LlmResponse(
+            text="The event models are available at their current location.",
+            tool_calls=[],
+            assistant_content=[
+                {"type": "text", "text": "The event models are available at their current location."}
+            ],
+        )
+
+
+class FileDeliveryProvider:
+    # 初始化调用计数并保存模型收到的文件交付反馈。
+    def __init__(self) -> None:
+        self._calls = 0
+        self.feedback_messages: list[dict] = []
+
+    # 先模拟空回答，再写入快速排序文件并在下一轮完成任务。
+    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
+        self._calls += 1
+        if self._calls == 1:
+            return LlmResponse(text="", tool_calls=[], assistant_content=[{"type": "text", "text": ""}])
+        if self._calls == 2:
+            self.feedback_messages = messages
+            return _tool_response(
+                "write-quicksort-1",
+                "write_file",
+                {
+                    "path": "tests/learning/quicksort.py",
+                    "content": "def quicksort(values: list[int]) -> list[int]:\n    return sorted(values)\n",
+                },
+            )
+        return LlmResponse(
+            text="Created tests/learning/quicksort.py.",
+            tool_calls=[],
+            assistant_content=[{"type": "text", "text": "Created tests/learning/quicksort.py."}],
+        )
+
+
+# 构造包含标准 tool_use 内容块的确定性工具调用响应。
+def _tool_response(call_id: str, name: str, arguments: dict) -> LlmResponse:
+    return LlmResponse(
+        text="Planning the next task.",
+        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+        assistant_content=[{"type": "tool_use", "id": call_id, "name": name, "input": arguments}],
+    )
+
+
+class AutonomousPlanningProvider:
+    # 初始化确定性规划步骤并保存运行器注入的工具定义名称。
+    def __init__(self) -> None:
+        self._calls = 0
+        self.tool_names: set[str] = set()
+
+    # 记录运行器提供的工具定义后返回同一 Provider 替身。
+    def with_tool_definitions(self, definitions: list[dict]) -> "AutonomousPlanningProvider":
+        self.tool_names = {definition["name"] for definition in definitions}
+        return self
+
+    # 模拟创建依赖任务、执行任务并输出最终交付结果的完整规划流程。
+    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
+        self._calls += 1
+        calls = [
+            ("create-1", "task_create", {"subject": "Inspect repository"}),
+            ("create-2", "task_create", {"subject": "Write structure report", "blocked_by": [1]}),
+            ("update-1", "task_update", {"task_id": 1, "status": "completed"}),
+            ("update-2", "task_update", {"task_id": 2, "status": "in_progress"}),
+            ("write-1", "write_file", {"path": "structure.md", "content": "# Structure\n"}),
+            ("update-3", "task_update", {"task_id": 2, "status": "completed"}),
+        ]
+        if self._calls <= len(calls):
+            return _tool_response(*calls[self._calls - 1])
+        return LlmResponse(
+            text="Repository structure report completed.",
+            tool_calls=[],
+            assistant_content=[{"type": "text", "text": "Repository structure report completed."}],
+        )
+
+
 # 功能：验证 AgentRunner 会执行读文件、持久化事件并完成多轮任务。
 # 设计：注入确定性 Claude 替身，覆盖 plan-act-observe 和 events.jsonl，而不依赖外部 API。
 def test_agent_runner_persists_end_to_end_events(tmp_path: Path, monkeypatch) -> None:
@@ -77,6 +183,59 @@ def test_agent_runner_records_provider_failure_in_summary_and_event(tmp_path: Pa
     assert finished_event["reason"] == "Provider request failed"
 
 
+# 功能：验证工具失败会作为观察结果写回上下文，使 Agent 能在下一轮自行纠正并成功完成。
+# 设计：先读取不存在的文件，再断言 Provider 收到失败 tool_result，同时保留工具失败事件用于终端观测。
+def test_agent_runner_recovers_from_tool_failure_by_returning_error_to_provider(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = RecoveringAnthropicProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=2),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus, _tools: provider,
+    )
+
+    summary = asyncio.run(runner.run("Inspect the event model implementation."))
+    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
+    event_types = [json.loads(line)["type"] for line in event_path.read_text(encoding="utf-8").splitlines()]
+    tool_results = [
+        content
+        for message in provider.messages_after_failure
+        if message["role"] == "user" and isinstance(message["content"], list)
+        for content in message["content"]
+        if content["type"] == "tool_result"
+    ]
+
+    assert summary.status == "success"
+    assert summary.result == "The event models are available at their current location."
+    assert "tool_call_failed" in event_types
+    assert len(tool_results) == 1
+    assert tool_results[0]["tool_use_id"] == "missing-read-1"
+    assert tool_results[0]["content"].startswith("Tool 'read_file' failed: file not found:")
+
+
+# 功能：验证文件交付目标在空回答后不会被误判成功，并会驱动模型写入并验证目标文件。
+# 设计：替身先返回无工具响应，再根据运行器反馈调用真实 write_file，以覆盖完成条件与文件存在性校验。
+def test_agent_runner_requires_verified_write_before_completing_file_delivery_goal(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FileDeliveryProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus, _tools: provider,
+    )
+
+    summary = asyncio.run(runner.run("Write a quicksort implementation to tests/learning/quicksort.py."))
+    target = tmp_path / "tests" / "learning" / "quicksort.py"
+
+    assert summary.status == "success"
+    assert target.read_text(encoding="utf-8").startswith("def quicksort")
+    assert any(
+        message["content"].startswith("The goal requires a workspace file")
+        for message in provider.feedback_messages
+        if message["role"] == "user" and isinstance(message["content"], str)
+    )
+
+
 # 功能：验证达到最大步数会将统一上下文状态标记为失败并输出失败原因。
 # 设计：复用含工具调用的替身，确保在已有执行步骤后触发步数限制。
 def test_agent_runner_records_max_steps_failure_in_summary_and_event(tmp_path: Path, monkeypatch) -> None:
@@ -112,3 +271,34 @@ def test_agent_runner_does_not_print_local_events(tmp_path: Path, capsys) -> Non
     assert summary.status == "failed"
     assert capsys.readouterr().out == ""
     assert json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])["type"] == "run_finished"
+
+
+# 功能：验证运行器为每次任务注册八个工具，并由 Agent 自主完成带依赖的任务规划和交付。
+# 设计：以确定性 Provider 串联创建、解锁、执行与完成操作，直接断言 run 私有 .tasks 文件和最终产物。
+def test_agent_runner_executes_autonomous_task_plan_in_isolated_run_directory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = AutonomousPlanningProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=7),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus, definitions: provider.with_tool_definitions(definitions),
+    )
+
+    summary = asyncio.run(runner.run("Analyze the repository and generate a structure report."))
+    tasks_dir = tmp_path / "runs" / summary.run_id / ".tasks"
+    second_task = json.loads((tasks_dir / "task_2.json").read_text(encoding="utf-8"))
+
+    assert provider.tool_names == {
+        "task_create",
+        "task_update",
+        "task_list",
+        "task_get",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "bash",
+    }
+    assert summary.status == "success"
+    assert (tmp_path / "structure.md").read_text(encoding="utf-8") == "# Structure\n"
+    assert second_task["status"] == "completed"
+    assert second_task["blocked_by"] == []

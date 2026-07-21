@@ -48,12 +48,13 @@ class AnthropicProvider:
         request_payload = {
             "model": self._config.default_model,
             "max_tokens": 4096,
-            "system": """
-                        "You are a helpful AI assistant. "
-                        "Use the available tools to complete the user's goal. "
-                        "When the goal is fully achieved, respond with a final answer "
-                        "and do not call any more tools."
-            """,
+            "system": (
+                "You are a helpful AI assistant. Use the available tools to complete the user's goal. "
+                "For multi-step work, first create a concise task plan with task_create, express task "
+                "dependencies with integer IDs, and use task_list to decide what is unblocked. Update a "
+                "task to in_progress before executing it and to completed only after it is done. "
+                "When the goal is fully achieved, respond with a final answer and do not call any more tools."
+            ),
             "messages": messages,
             "tools": self._tool_definitions,
             "cache_control": {"type": "ephemeral"},
