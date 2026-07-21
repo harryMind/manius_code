@@ -8,22 +8,27 @@ from pydantic import BaseModel
 
 
 TraceDirection = Literal[
-    "client_to_core",
-    "core_to_client",
-    "core_event",
-    "core_to_llm",
-    "llm_to_core",
+    "CLIENT->CORE",
+    "CORE>CLIENT",
+    "CORE",
+    "CORE>LLM",
+    "LLM>CORE",
 ]
+TraceLayer = Literal["ipc", "event", "llm"]
 
 logger = logging.getLogger(__name__)
 
 
 class TraceRecord(BaseModel):
-    timestamp: str
+    ts: str
     direction: TraceDirection
+    layer: TraceLayer
+    kind: str
     run_id: str | None = None
+    step: int | None = None
+    client_id: str | None = None
     trace_id: str | None = None
-    payload: dict[str, Any]
+    data: dict[str, Any]
 
 
 class TracingProvider:
@@ -49,19 +54,27 @@ class TracingProvider:
     def emit(
         self,
         direction: TraceDirection,
-        payload: dict[str, Any],
+        layer: TraceLayer,
+        kind: str,
+        data: dict[str, Any],
         *,
         run_id: str | None = None,
+        step: int | None = None,
+        client_id: str | None = None,
         trace_id: str | None = None,
     ) -> None:
         if not self._accepting:
             return
         record = TraceRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            ts=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             direction=direction,
+            layer=layer,
+            kind=kind,
             run_id=run_id,
+            step=step,
+            client_id=client_id,
             trace_id=trace_id,
-            payload=payload,
+            data=data,
         )
         try:
             self._queue.put_nowait(record)

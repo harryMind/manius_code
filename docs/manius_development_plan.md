@@ -133,7 +133,7 @@ uv run pytest tests/unit tests/integration -q
 
 ### 已实现内容
 
-- 新增 `core.tracing.TracingProvider` 与 `TraceRecord`：采用有界 `asyncio.Queue` 接收五类追踪记录，批量文件 I/O 转交工作线程，确保业务协程只执行同步 `emit()` 与 `put_nowait()`；daemon 关闭时停止接收新记录、排空队列并关闭文件。
+- 新增 `core.tracing.TracingProvider` 与 `TraceRecord`：记录以 `ts`、`layer`、`direction`、`kind`、`run_id`、`step`、`client_id`、`trace_id` 和开放的 `data` 组成；采用有界 `asyncio.Queue` 接收五类追踪记录，批量文件 I/O 转交工作线程，确保业务协程只执行同步 `emit()` 与 `put_nowait()`；daemon 关闭时停止接收新记录、排空队列并关闭文件。
 - 新增 `ManiusConfig.trace`：默认启用，默认文件为 `~/.manius/traces/daemon.jsonl`，并支持 `MANIUS_TRACE_ENABLED`、`MANIUS_TRACE_FILE`、`MANIUS_TRACE_MAX_QUEUE_SIZE`。追踪目录不可写时 daemon 会保留正常服务能力并记录告警。
 - `SocketServer` 记录完整入站 JSON-RPC 帧、坏帧原文和所有响应；`IpcEventBroadcaster` 在写入前记录完整 `event.push` 信封。
 - `EventBus` 以注入的全局追踪器记录每个业务事件；`AnthropicProvider` 记录完整请求参数和流结束后的完整最终响应，不单独记录 token 增量。
@@ -145,7 +145,7 @@ uv run pytest tests/unit tests/integration -q
 
 1. **全局单文件**：所有追踪记录写入统一的全局文件，覆盖无run\_id的全局命令与跨run的时序问题
 2. **非阻塞写入**：追踪写入完全不阻塞主asyncio事件循环，对业务性能零影响
-3. **全量原始数据**：记录完整的原始请求/响应/事件 payload，不做裁剪，保留调试所需的全部信息
+3. **全量原始数据**：记录完整的原始请求/响应/事件 `data`，不做裁剪，保留调试所需的全部信息
 4. **与现有体系互补**：与per-run的 `events.jsonl` 分工明确，不重复、不冲突
 5. **低侵入性**：通过埋点与订阅方式接入现有组件，无需修改核心业务逻辑
 
@@ -161,61 +161,67 @@ uv run pytest tests/unit tests/integration -q
 
 | 字段 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `timestamp` | string | 是 | ISO8601 高精度时间戳（毫秒级），全局排序依据 |
-| `direction` | string | 是 | 数据流方向枚举，共5种，对应系统全量I/O与内部事件 |
-| `run_id` | string/null | 是 | 关联的任务运行ID，全局命令/未解析出run\_id时为null |
-| `trace_id` | string/null | 否 | 请求-响应关联标识（如JSON-RPC的id、LLM请求唯一标识） |
-| `payload` | object | 是 | 完整原始数据，不同方向对应不同内容 |
+| `ts` | string | 是 | ISO8601 毫秒级时间戳，全局排序依据 |
+| `direction` | string | 是 | 数据流向：`CLIENT->CORE`、`CORE>CLIENT`、`CORE`、`CORE>LLM`、`LLM>CORE` |
+| `layer` | string | 是 | 子系统：`ipc`、`event` 或 `llm` |
+| `kind` | string | 是 | 更细粒度分类，例如 `request`、`response`、`push` 或业务事件类型 |
+| `run_id` | string/null | 是 | 关联任务运行 ID；全局命令或尚未生成任务 ID 时为 `null` |
+| `step` | int/null | 是 | Agent 步骤；不属于任务步骤的记录为 `null` |
+| `client_id` | string/null | 是 | IPC 客户端 TCP 对端地址；非 IPC 记录为 `null` |
+| `trace_id` | string/null | 否 | 请求-响应或 LLM 往返关联标识 |
+| `data` | object | 是 | 开放载荷；IPC 放原始帧，事件层放完整事件，LLM 层放完整报文及统计摘要 |
 
 **五个数据流方向定义**：
 
-| 方向枚举 | 所属层级 | 含义 | payload内容 |
+| direction | layer | kind | data内容 |
 | --- | --- | --- | --- |
-| `client_to_core` | IPC层 | 客户端发往守护进程的JSON-RPC请求 | 完整的请求帧：`id`、`method`、`params` |
-| `core_to_client` | IPC层 | 守护进程发往客户端的响应与主动推送 | 完整的响应帧/通知帧：`id`、`result`/`error`、`method`、`params` |
-| `core_event` | 事件层 | EventBus发布的所有业务事件 | 完整的事件对象，与`events.jsonl`中记录一致 |
-| `core_to_llm` | LLM层 | 发往Anthropic API的完整请求 | 全量请求参数：`model`、`messages`、`tools`、`max_tokens`、`cache_control`等 |
-| `llm_to_core` | LLM层 | Anthropic API返回的完整响应 | 全量响应体：`content`、`stop_reason`、`stop_sequence`、`usage`等 |
+| `CLIENT->CORE` | `ipc` | `request`、`parse_error`、`invalid_request` | 原始 JSON-RPC 请求帧或坏帧文本与错误 |
+| `CORE>CLIENT` | `ipc` | `response` | 完整 JSON-RPC 响应帧 |
+| `CORE>CLIENT` | `ipc` | `push` | 完整 `event.push` 通知信封 |
+| `CORE` | `event` | 业务事件 `type` | 完整 EventBus 事件，与 `events.jsonl` 一致 |
+| `CORE>LLM` | `llm` | `request` | 完整请求、`message_count` 与 `tool_count` |
+| `LLM>CORE` | `llm` | `response` | 完整最终响应、`usage` 与 content 块数量 |
 
 #### 2. 四个埋点：全覆盖五条数据流
 
 在系统关键节点设置4个埋点，完整覆盖5个数据流方向，所有埋点统一调用追踪管理器的`emit()`接口。
 
-##### 埋点1：SocketServer 请求入口（覆盖 client_to_core）
+##### 埋点1：SocketServer 请求入口（`CLIENT->CORE` / `ipc`）
 
 - **接入位置**：`SocketServer` 的请求处理流程中，NDJSON帧解析完成、方法分发之前
 - **触发时机**：每收到一条完整的客户端请求帧（含解析失败的坏帧）
 - **记录逻辑**：
-  - 正常请求：记录完整JSON-RPC请求对象，`trace_id` 取请求的`id`字段
-  - 解析失败的坏帧：记录原始文本与错误信息，用于排查协议兼容问题
+  - 正常请求：`kind="request"`，记录完整JSON-RPC请求对象，`trace_id` 取请求的`id`字段
+  - 解析失败的坏帧：`kind="parse_error"`，记录原始文本与错误信息
   - 初始`run_id`为`null`，此时尚未解析业务参数
+  - `client_id`使用 TCP 对端地址
 
-##### 埋点2：SocketServer 响应/推送出口（覆盖 core_to_client）
+##### 埋点2：SocketServer 响应/推送出口（`CORE>CLIENT` / `ipc`）
 
 - **接入位置**：两处出口
   1. 方法处理器执行完成，向客户端返回JSON-RPC响应时
   2. `IpcEventBroadcaster` 向订阅端推送 `event.push` 通知时
 - **触发时机**：所有向客户端写入NDJSON帧之前
 - **记录逻辑**：
-  - 响应帧：`trace_id` 取对应请求的`id`，关联请求与响应
-  - 推送通知：从事件参数中提取`run_id`填充
+  - 响应帧：`kind="response"`，`trace_id` 取对应请求的`id`，关联请求与响应
+  - 推送通知：`kind="push"`，从事件参数中提取`run_id`和`step`填充
 
-##### 埋点3：EventBus 全局订阅（覆盖 core_event）
+##### 埋点3：EventBus 全局订阅（`CORE` / `event`）
 
 - **接入方式**：追踪管理器作为 `EventBus` 的全局订阅者，订阅 `topics=["*"]`
 - **触发时机**：EventBus发布任意业务事件时
-- **记录逻辑**：直接透传完整事件对象，从事件中提取`run_id`填充
+- **记录逻辑**：直接透传完整事件对象，事件 `type` 写入 `kind`，并从事件中提取`run_id`和`step`
 - **说明**：与 `EventWriter` 写入 `events.jsonl` 的数据同源，用于和IPC、LLM数据对齐时间线
 
-##### 埋点4：AnthropicProvider 请求前后（覆盖 core_to_llm + llm_to_core）
+##### 埋点4：AnthropicProvider 请求前后（`CORE>LLM` / `LLM>CORE` / `llm`）
 
 - **接入位置**：`AnthropicProvider` 的流式请求方法中
 - **触发时机**：
   1. 发起API请求前，记录完整请求参数
   2. 流式接收结束、拿到完整响应后，记录完整响应体
 - **记录逻辑**：
-  - `core_to_llm`：记录全量请求参数，包含完整`messages`数组与工具定义，`run_id`从执行上下文中获取
-  - `llm_to_core`：记录完整API响应，包含`stop_reason`、`usage`与所有content块
+  - `CORE>LLM`：`kind="request"`，记录全量请求、`message_count`和`tool_count`
+  - `LLM>CORE`：`kind="response"`，记录完整API响应、`usage`与所有content块
   - 流式token增量不单独记录，避免文件过度膨胀，token统计以最终响应的`usage`为准
 
 #### 3. 非阻塞写入机制：队列 + 后台Drain任务
@@ -296,29 +302,29 @@ uv run manius-core
 # 2. 验证全局命令追踪
 uv run manius ping
 # 检查 ~/.manius/traces/daemon.jsonl，包含：
-# - client_to_core 方向的 core.ping 请求
-# - core_to_client 方向的 ping 响应
-# 两条记录均无 run_id，时间戳递增
+# - CLIENT->CORE / ipc / request 的 core.ping 请求
+# - CORE>CLIENT / ipc / response 的 ping 响应
+# 两条记录均无 run_id，ts 递增且 trace_id 一致
 
 # 3. 验证全链路追踪
 uv run manius run --goal "请读取 README.md 并总结"
 # 检查 daemon.jsonl，按时间顺序包含以下记录：
-# 1. client_to_core: agent.run 请求
-# 2. core_event: run_started 事件
-# 3. core_to_llm: 完整的 Claude API 请求（含messages与工具定义）
-# 4. llm_to_core: 完整的 Claude API 响应（含stop_reason、usage）
-# 5. core_event: 工具调用相关事件、step事件
-# 6. core_event: run_finished 事件
-# 7. core_to_client: agent.run 响应
-# 8. core_to_client: event.push 推送通知
-# 所有记录时间戳全局递增，run_id正确关联
+# 1. CLIENT->CORE / ipc / request: agent.run 请求
+# 2. CORE / event / run_started: 任务启动事件
+# 3. CORE>LLM / llm / request: 完整 Claude 请求及消息统计
+# 4. LLM>CORE / llm / response: 完整 Claude 响应及 usage
+# 5. CORE / event: 工具调用和步骤事件
+# 6. CORE / event / run_finished: 任务结束事件
+# 7. CORE>CLIENT / ipc / response: agent.run 响应
+# 8. CORE>CLIENT / ipc / push: event.push 通知
+# 所有记录 ts 全局递增，run_id、step 和 trace_id 正确关联
 
 # 4. 验证优雅关闭
 # Ctrl+C 停止 daemon，检查队列中记录全部写入，无数据丢失
 
 # 5. 验证调试能力
 # 可通过 jq 过滤查看 LLM 的 stop_reason：
-jq 'select(.direction == "llm_to_core") | .payload.stop_reason' ~/.manius/traces/daemon.jsonl
+jq 'select(.direction == "LLM>CORE" and .layer == "llm") | .data.response.stop_reason' ~/.manius/traces/daemon.jsonl
 ```
 
 #### 测试覆盖

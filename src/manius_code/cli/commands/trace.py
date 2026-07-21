@@ -20,7 +20,7 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     filter_parser = actions.add_parser("filter", help="Filter persisted trace records")
     filters = filter_parser.add_mutually_exclusive_group(required=True)
     filters.add_argument("--run-id", help="Show records for one Agent run")
-    filters.add_argument("--direction", choices=("client_to_core", "core_to_client", "core_event", "core_to_llm", "llm_to_core"))
+    filters.add_argument("--direction", choices=("CLIENT->CORE", "CORE>CLIENT", "CORE", "CORE>LLM", "LLM>CORE"))
     filter_parser.set_defaults(handler=filter_records)
 
     llm_parser = actions.add_parser("llm", help="Show LLM request and response traces")
@@ -63,7 +63,7 @@ def llm(config: ManiusConfig, run_id: str, **_: object) -> None:
     for record in _read_records(config.trace.file):
         if record.get("run_id") != run_id:
             continue
-        if record.get("direction") not in {"core_to_llm", "llm_to_core"}:
+        if record.get("direction") not in {"CORE>LLM", "LLM>CORE"}:
             continue
         print(json.dumps(record, ensure_ascii=False))
 

@@ -59,16 +59,36 @@ class AnthropicProvider:
             "cache_control": {"type": "ephemeral"},
         }
         if self._tracer is not None:
-            self._tracer.emit("core_to_llm", request_payload, run_id=run_id, trace_id=trace_id)
+            self._tracer.emit(
+                "CORE>LLM",
+                "llm",
+                "request",
+                {
+                    "request": request_payload,
+                    "message_count": len(messages),
+                    "tool_count": len(self._tool_definitions),
+                },
+                run_id=run_id,
+                step=step,
+                trace_id=trace_id,
+            )
         async with client.messages.stream(**request_payload) as stream:
             async for token in stream.text_stream:
                 await self._event_bus.publish(LlmTokenEvent(run_id=run_id, step=step, token=token))
             response = await stream.get_final_message()
         if self._tracer is not None:
+            response_payload = self._response_payload(response)
             self._tracer.emit(
-                "llm_to_core",
-                self._response_payload(response),
+                "LLM>CORE",
+                "llm",
+                "response",
+                {
+                    "response": response_payload,
+                    "usage": response_payload.get("usage", {}),
+                    "content_block_count": len(response_payload.get("content", [])),
+                },
                 run_id=run_id,
+                step=step,
                 trace_id=trace_id,
             )
         text_parts: list[str] = []

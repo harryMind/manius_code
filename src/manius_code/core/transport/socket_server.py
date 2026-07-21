@@ -95,21 +95,27 @@ class SocketServer:
     # 处理一条请求并将 JSON-RPC 响应发送给客户端。
     async def _dispatch(self, line: bytes, writer: asyncio.StreamWriter) -> None:
         try:
-            response = await self._make_response(line, writer)
-            self._trace_response(response)
+            client_id = self._client_id(writer)
+            response = await self._make_response(line, writer, client_id)
+            self._trace_response(response, client_id)
             writer.write(response.model_dump_json().encode() + b"\n")
             await writer.drain()
         except (ConnectionError, OSError):
             logger.debug("Client disconnected before receiving a response")
 
     # 验证请求、调用已注册处理器并封装 JSON-RPC 响应。
-    async def _make_response(self, line: bytes, writer: asyncio.StreamWriter) -> JsonRpcSuccess | JsonRpcError:
+    async def _make_response(
+        self,
+        line: bytes,
+        writer: asyncio.StreamWriter,
+        client_id: str | None,
+    ) -> JsonRpcSuccess | JsonRpcError:
         try:
             raw_request = json.loads(line)
         except json.JSONDecodeError:
-            self._trace_request_parse_error(line)
+            self._trace_request_parse_error(line, client_id)
             return make_error(None, PARSE_ERROR, "Parse error")
-        self._trace_request(raw_request)
+        self._trace_request(raw_request, client_id)
         try:
             request = JsonRpcRequest.model_validate(raw_request)
         except ValidationError:
@@ -144,40 +150,62 @@ class SocketServer:
         return result.model_dump() if isinstance(result, BaseModel) else result
 
     # 记录已成功解析的原始 JSON-RPC 请求并保留请求关联标识。
-    def _trace_request(self, raw_request: Any) -> None:
+    def _trace_request(self, raw_request: Any, client_id: str | None) -> None:
         if self._tracer is None:
             return
         if isinstance(raw_request, dict):
             self._tracer.emit(
-                "client_to_core",
+                "CLIENT->CORE",
+                "ipc",
+                "request",
                 raw_request,
+                client_id=client_id,
                 trace_id=self._trace_id(raw_request.get("id")),
             )
             return
-        self._tracer.emit("client_to_core", {"raw": raw_request, "error": "Invalid Request"})
+        self._tracer.emit(
+            "CLIENT->CORE",
+            "ipc",
+            "invalid_request",
+            {"raw": raw_request, "error": "Invalid Request"},
+            client_id=client_id,
+        )
 
     # 记录无法解析的 NDJSON 帧文本与解析错误，便于定位协议兼容问题。
-    def _trace_request_parse_error(self, line: bytes) -> None:
+    def _trace_request_parse_error(self, line: bytes, client_id: str | None) -> None:
         if self._tracer is not None:
             self._tracer.emit(
-                "client_to_core",
+                "CLIENT->CORE",
+                "ipc",
+                "parse_error",
                 {"raw": line.decode("utf-8", errors="replace").rstrip("\r\n"), "error": "Parse error"},
+                client_id=client_id,
             )
 
     # 在写入 TCP 连接前记录完整的 JSON-RPC 响应帧。
-    def _trace_response(self, response: JsonRpcSuccess | JsonRpcError) -> None:
+    def _trace_response(self, response: JsonRpcSuccess | JsonRpcError, client_id: str | None) -> None:
         if self._tracer is None:
             return
         payload = response.model_dump(mode="json")
         result = payload.get("result")
         run_id = result.get("run_id") if isinstance(result, dict) else None
         self._tracer.emit(
-            "core_to_client",
+            "CORE>CLIENT",
+            "ipc",
+            "response",
             payload,
             run_id=run_id if isinstance(run_id, str) else None,
+            client_id=client_id,
             trace_id=self._trace_id(response.id),
         )
 
     # 将 JSON-RPC 标识标准化为追踪记录使用的可选字符串。
     def _trace_id(self, value: int | str | None) -> str | None:
         return str(value) if value is not None else None
+
+    # 从 TCP 对端地址生成可用于关联 IPC 收发记录的客户端标识。
+    def _client_id(self, writer: asyncio.StreamWriter) -> str | None:
+        peername = writer.get_extra_info("peername")
+        if isinstance(peername, tuple) and len(peername) >= 2:
+            return f"{peername[0]}:{peername[1]}"
+        return str(peername) if peername is not None else None

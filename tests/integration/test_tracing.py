@@ -56,9 +56,13 @@ def test_core_ping_writes_global_ipc_trace(tmp_path: Path, free_port: int) -> No
         process.terminate()
         process.wait(timeout=5)
 
-    request = next(record for record in records if record["direction"] == "client_to_core")
-    response = next(record for record in records if record["direction"] == "core_to_client")
-    assert request["payload"]["method"] == "core.ping"
+    request = next(record for record in records if record["direction"] == "CLIENT->CORE")
+    response = next(record for record in records if record["direction"] == "CORE>CLIENT")
+    assert request["layer"] == response["layer"] == "ipc"
+    assert request["kind"] == "request"
+    assert response["kind"] == "response"
+    assert request["data"]["method"] == "core.ping"
     assert request["run_id"] is None
     assert response["trace_id"] == request["trace_id"]
+    assert response["client_id"] == request["client_id"]
     assert response["run_id"] is None

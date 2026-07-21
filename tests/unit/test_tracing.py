@@ -24,16 +24,18 @@ def test_tracing_provider_drains_global_file_on_stop(tmp_path: Path) -> None:
         trace_path = tmp_path / "traces" / "daemon.jsonl"
         tracer = TracingProvider(trace_path, max_queue_size=8)
         await tracer.start()
-        tracer.emit("client_to_core", {"method": "core.ping"}, trace_id="rpc-1")
-        tracer.emit("core_event", {"type": "run_started"}, run_id="run-1")
+        tracer.emit("CLIENT->CORE", "ipc", "request", {"method": "core.ping"}, trace_id="rpc-1")
+        tracer.emit("CORE", "event", "run_started", {"type": "run_started"}, run_id="run-1", step=0)
         await tracer.stop()
         return [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
 
     records = asyncio.run(exercise())
-    assert [record["direction"] for record in records] == ["client_to_core", "core_event"]
+    assert [record["direction"] for record in records] == ["CLIENT->CORE", "CORE"]
+    assert [(record["layer"], record["kind"]) for record in records] == [("ipc", "request"), ("event", "run_started")]
     assert records[0]["trace_id"] == "rpc-1"
     assert records[1]["run_id"] == "run-1"
-    assert re.fullmatch(r".+\+00:00", records[0]["timestamp"])
+    assert records[1]["step"] == 0
+    assert re.fullmatch(r".+\+00:00", records[0]["ts"])
 
 
 # 功能：验证 SocketServer 对正常请求、损坏帧及对应响应均写入完整 IPC 追踪记录。
@@ -69,12 +71,16 @@ def test_socket_server_traces_requests_responses_and_parse_errors(tmp_path: Path
         return str(response.id), [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
 
     request_id, records = asyncio.run(exercise())
-    request = next(record for record in records if record["direction"] == "client_to_core" and record["trace_id"] == request_id)
-    response = next(record for record in records if record["direction"] == "core_to_client" and record["trace_id"] == request_id)
-    parse_error = next(record for record in records if record["payload"].get("error") == "Parse error")
-    assert request["payload"]["params"] == {"value": "complete-payload"}
-    assert response["payload"]["result"] == {"echo": {"value": "complete-payload"}}
-    assert parse_error["payload"]["raw"] == "{not-json}"
+    request = next(record for record in records if record["direction"] == "CLIENT->CORE" and record["trace_id"] == request_id)
+    response = next(record for record in records if record["direction"] == "CORE>CLIENT" and record["trace_id"] == request_id)
+    parse_error = next(record for record in records if record["data"].get("error") == "Parse error")
+    assert request["data"]["params"] == {"value": "complete-payload"}
+    assert request["layer"] == "ipc"
+    assert request["kind"] == "request"
+    assert response["data"]["result"] == {"echo": {"value": "complete-payload"}}
+    assert response["kind"] == "response"
+    assert request["client_id"] == response["client_id"]
+    assert parse_error["data"]["raw"] == "{not-json}"
     assert request["run_id"] is None
 
 
@@ -117,11 +123,15 @@ def test_event_bus_and_ipc_push_are_traced(tmp_path: Path, free_port: int) -> No
         return received_event, [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
 
     received_event, records = asyncio.run(exercise())
-    core_event = next(record for record in records if record["direction"] == "core_event")
-    push = next(record for record in records if record["direction"] == "core_to_client" and record["payload"].get("method") == "event.push")
+    core_event = next(record for record in records if record["direction"] == "CORE")
+    push = next(record for record in records if record["direction"] == "CORE>CLIENT" and record["data"].get("method") == "event.push")
     assert received_event["type"] == "step_planning"
-    assert core_event["payload"]["plan"] == "inspect file"
-    assert push["payload"]["params"]["run_id"] == "run-1"
+    assert core_event["layer"] == "event"
+    assert core_event["kind"] == "step_planning"
+    assert core_event["step"] == 1
+    assert core_event["data"]["plan"] == "inspect file"
+    assert push["kind"] == "push"
+    assert push["data"]["params"]["run_id"] == "run-1"
 
 
 # 功能：验证 AnthropicProvider 只追踪完整请求和最终响应，而不追踪逐 token 增量。
@@ -145,8 +155,13 @@ def test_anthropic_provider_traces_full_request_and_final_response(tmp_path: Pat
 
     records = asyncio.run(exercise())
     request, response = records
-    assert [record["direction"] for record in records] == ["core_to_llm", "llm_to_core"]
+    assert [record["direction"] for record in records] == ["CORE>LLM", "LLM>CORE"]
     assert request["trace_id"] == response["trace_id"]
-    assert request["payload"]["cache_control"] == {"type": "ephemeral"}
-    assert request["payload"]["tools"][0]["name"] == "read_file"
-    assert response["payload"]["content"][0]["text"] == "I will read the file."
+    assert request["layer"] == response["layer"] == "llm"
+    assert request["kind"] == "request"
+    assert request["step"] == response["step"] == 1
+    assert request["data"]["message_count"] == 1
+    assert request["data"]["request"]["cache_control"] == {"type": "ephemeral"}
+    assert request["data"]["request"]["tools"][0]["name"] == "read_file"
+    assert response["kind"] == "response"
+    assert response["data"]["response"]["content"][0]["text"] == "I will read the file."

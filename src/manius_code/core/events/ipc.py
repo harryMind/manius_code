@@ -65,12 +65,23 @@ class IpcEventBroadcaster:
             envelope = EventPushEnvelope(params=event)
             if self._tracer is not None:
                 self._tracer.emit(
-                    "core_to_client",
+                    "CORE>CLIENT",
+                    "ipc",
+                    "push",
                     envelope.model_dump(mode="json"),
                     run_id=event.run_id,
+                    step=event.step,
+                    client_id=self._client_id(subscription.writer),
                 )
             subscription.writer.write(envelope.model_dump_json().encode() + b"\n")
             await subscription.writer.drain()
         except (ConnectionError, OSError, RuntimeError):
             logger.debug("Removing disconnected event subscriber")
             self.unsubscribe(subscription.sub_id)
+
+    # 从 TCP 对端地址生成可用于关联推送记录的客户端标识。
+    def _client_id(self, writer: asyncio.StreamWriter) -> str | None:
+        peername = writer.get_extra_info("peername")
+        if isinstance(peername, tuple) and len(peername) >= 2:
+            return f"{peername[0]}:{peername[1]}"
+        return str(peername) if peername is not None else None
