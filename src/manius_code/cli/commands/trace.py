@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from manius_code.core.config import ManiusConfig
+from manius_code.core.tracing import trace_paths
 
 
 # 向顶层 CLI 解析器注册全局追踪文件的查看子命令。
@@ -16,6 +17,10 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 
     tail_parser = actions.add_parser("tail", help="Follow new trace records")
     tail_parser.set_defaults(handler=tail)
+
+    follow_parser = actions.add_parser("follow", help="Print recent trace records and follow new records")
+    follow_parser.add_argument("--line", type=_positive_line, default=10, help="Number of recent records to print first")
+    follow_parser.set_defaults(handler=follow)
 
     filter_parser = actions.add_parser("filter", help="Filter persisted trace records")
     filters = filter_parser.add_mutually_exclusive_group(required=True)
@@ -30,7 +35,29 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
 
 # 持续输出追踪文件中新追加的有效 JSON Lines 记录。
 def tail(config: ManiusConfig, **_: object) -> None:
-    path = config.trace.file
+    _follow_file(config.trace.file)
+
+
+# 先输出最后指定数量的追踪记录，再持续跟随活动追踪文件。
+def follow(config: ManiusConfig, line: int = 10, **_: object) -> None:
+    for record in _read_records(config.trace.file)[-line:]:
+        print(json.dumps(record, ensure_ascii=False))
+    _follow_file(config.trace.file)
+
+
+# 将命令行的初始输出行数限制为正整数。
+def _positive_line(value: str) -> int:
+    try:
+        line = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("line must be a positive integer") from error
+    if line < 1:
+        raise argparse.ArgumentTypeError("line must be a positive integer")
+    return line
+
+
+# 持续读取活动文件新增内容，并在轮转后从新文件开头继续读取。
+def _follow_file(path: Path) -> None:
     position = path.stat().st_size if path.is_file() else 0
     try:
         while True:
@@ -70,16 +97,19 @@ def llm(config: ManiusConfig, run_id: str, **_: object) -> None:
 
 # 从 JSONL 追踪文件读取并忽略损坏或非对象记录。
 def _read_records(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
     records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for trace_path in trace_paths(path):
         try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
+            with trace_path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        records.append(record)
+        except OSError:
             continue
-        if isinstance(record, dict):
-            records.append(record)
     return records
 
 

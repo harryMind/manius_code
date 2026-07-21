@@ -126,7 +126,12 @@ class CoreApp:
         self._config = config
         setup_logging(config)
         if config.trace.enabled:
-            tracer = TracingProvider(config.trace.file, config.trace.max_queue_size)
+            tracer = TracingProvider(
+                config.trace.file,
+                config.trace.max_queue_size,
+                config.trace.max_size_mb,
+                config.trace.backup_count,
+            )
             try:
                 await tracer.start()
             except OSError as error:
