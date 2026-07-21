@@ -51,21 +51,24 @@ def test_tui_updates_tool_call_block_in_place() -> None:
     # 驱动单次工具调用从运行中到成功完成。
     async def exercise() -> None:
         app = ManiusTui(ManiusConfig(port=1))
-        async with app.run_test():
+        async with app.run_test() as pilot:
             await app.handle_event(
                 ToolCallStartEvent(run_id="run-a", tool_name="read_file", arguments={"path": "README.md"}).model_dump(mode="json")
             )
+            await pilot.pause()
             block = app._tool_blocks[("run-a", "read_file")]
             await app.handle_event(
                 ToolCallSuccessEvent(run_id="run-a", tool_name="read_file", duration_ms=5, result="content").model_dump(mode="json")
             )
+            await pilot.pause()
             assert ("run-a", "read_file") not in app._tool_blocks
             assert block._duration_ms == 5
             assert block._error is None
             assert block._result == "content"
             block.on_click()
+            await pilot.pause()
             assert block._expanded is True
-            assert "output:" in str(block.render())
+            assert "output:" in str(block._render_summary())
 
     asyncio.run(exercise())
 

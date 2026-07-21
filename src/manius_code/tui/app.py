@@ -78,10 +78,10 @@ class ToolCallBlock(Static):
         self._error: str | None = None
         self._result: str | None = None
         self._expanded = False
-        super().__init__(self._render())
+        super().__init__(self._render_summary())
 
     # 根据工具状态生成一行带颜色的摘要文本。
-    def _render(self) -> Text:
+    def _render_summary(self) -> Text:
         text = Text("  ")
         text.append("tool ", style="dim")
         text.append(self._tool_name, style="bold")
@@ -114,13 +114,13 @@ class ToolCallBlock(Static):
         self._duration_ms = duration_ms
         self._error = error
         self._result = result
-        self.update(self._render())
+        self.update(self._render_summary())
 
     # 点击摘要行时切换完整参数与工具输出的可见状态。
     def on_click(self) -> None:
         self._expanded = not self._expanded
         self.set_class(self._expanded, "expanded")
-        self.update(self._render())
+        self.update(self._render_summary())
 
 
 class ManiusTui(App[None]):
