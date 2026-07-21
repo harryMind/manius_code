@@ -351,3 +351,122 @@ S3完成后，系统具备全链路可观测能力，可直接定位以下问题
 3. LLM结束的真实原因（`end_turn`/`tool_use`/`max_tokens`），区分主动结束与被动截断
 4. 事件推送是否丢失、延迟，IPC层与内部事件层的时序是否一致
 5. 多客户端并发时的命令顺序与事件分发是否正确
+
+## s4: Agent的自主规划
+
+## 一、阶段核心目标
+
+将原 IPC 层的**外部人工操控任务系统**，内化为 Agent 的**私有认知规划工具**，实现能力跃迁：用户仅需输入单一高层目标，Agent 自主完成「任务拆解 → 依赖编排 → 逐任务执行 → 结果交付」全流程，无需人工分步触发指令。
+全程复用现有 AgentLoop 执行内核与事件体系，通过扩展工具集的方式赋予 LLM 自主规划能力，同时保留 CLI/TUI 的全链路可观测性。
+
+## 二、核心架构改造要求
+
+1. **AgentRunner 集成 TaskManager**
+   - 在 `AgentRunner.run_and_capture()` 中为每个 run 独立初始化 `TaskManager` 实例，任务存储路径固定为 `runs/<run_id>/.tasks`，实现单 run 数据隔离，支持历史规划回溯。
+   - 将 `TaskManager` 实例注入工具构建流程，4 个任务工具共享同一实例，确保任务读写状态一致。
+   - 不改动 S2/S3 已有的 run\_id 生成、后台任务调度、事件广播机制，保持架构向下兼容。
+2. **工具注册表扩容**
+   - 工具总数从原有基础工具扩展为 8 个：4 个任务规划工具 + 4 个执行类工具。
+   - 所有工具统一接入 `ToolRegistry`，复用原有 `ToolInvoker` 调用逻辑与工具事件广播机制，无需改造执行内核。
+
+## 三、核心模块实现规范：TaskManager
+
+### 定位
+
+纯同步文件 CRUD 层，**无异步方法、无 EventBus 依赖、无内置状态机**，仅负责任务数据持久化与依赖自动级联，所有规划决策完全交由 LLM 处理。
+
+### 存储设计
+
+- 每个任务对应一个独立 JSON 文件，命名格式 `task_<整数ID>.json`，存储于对应 run 的`.tasks`目录下。
+- 任务 ID 使用自增整数，禁止使用 UUID，降低 LLM 记忆成本与调用错误率。
+- 任务固定字段：`id`(int)、`subject`(str)、`description`(str)、`status`(三态枚举：pending/in\_progress/completed)、`blocked_by`(list\[int\])、`created_at`(ISO 时间戳)、`updated_at`(ISO 时间戳)。
+- 仅保留基础三态，不实现 pause、retry、cancel 等流程状态，相关逻辑由 LLM 通过工具调用自主控制。
+
+### 核心方法
+
+1. `create(subject, description="", blocked_by=None)`
+生成自增 ID，写入任务文件，返回任务对象；支持创建时直接指定依赖任务 ID。
+2. `update(task_id, status=None, add_blocked_by=None, remove_blocked_by=None)`
+读取对应任务文件，更新指定字段；若将状态更新为`completed`，自动触发依赖清理逻辑。
+3. `clear_dependency(completed_id)`
+扫描`.tasks`目录下所有任务文件，移除所有任务`blocked_by`字段中的已完成任务 ID，自动更新文件时间戳，实现依赖自动解锁，无需 LLM 手动维护。
+4. `list()`
+返回全部任务列表，输出为 LLM 友好的紧凑文本格式：用`[]`标记 pending、`[>]`标记 in\_progress、`[x]`标记 completed，同步标注`blocked_by`依赖，便于 LLM 快速判断可执行任务。
+5. `get(task_id)`
+读取单个任务的完整 JSON 数据，返回详情。
+
+### 约束
+
+- 所有方法均为同步实现，直接操作本地文件，不引入任何异步逻辑。
+- 轻量化设计：任务量级为个位数到十几，文件 IO 开销可忽略，不引入数据库，便于直接通过命令行调试查看。
+
+## 四、工具集实现规范
+
+共 8 个工具，全部遵循原有工具抽象规范，支持自动生成 schema、被 ToolInvoker 调用、触发标准工具调用事件。
+
+### 1. 任务规划工具（4 个）
+
+- `TaskCreateTool`：封装`TaskManager.create`，入参为任务主题、描述、依赖 ID 列表，返回创建结果。
+- `TaskUpdateTool`：封装`TaskManager.update`，入参为任务 ID、目标状态、依赖调整项，返回更新后任务信息。
+- `TaskListTool`：封装`TaskManager.list`，无必选入参，返回格式化的全量任务状态摘要。
+- `TaskGetTool`：封装`TaskManager.get`，入参为任务 ID，返回单个任务完整详情。
+
+### 2. 执行类工具（4 个）
+
+- `ReadFileTool`：读取本地文件内容，设置 512KB 大小上限，超出自动截断。
+- `WriteFileTool`：写入文件内容，自动创建父目录，增加路径穿越防护。
+- `ListDirTool`：列出目录结构，支持控制递归深度。
+- `BashTool`：执行 Shell 命令，合并标准输出与错误输出，设置 64KB 输出大小上限。
+
+## 五、Agent 执行链路适配
+
+1. **完全复用 AgentLoop 核心逻辑**
+无需修改 S1 已实现的`plan → observe → act`循环框架与状态机，仅需在调用 LLM 时，将全部 8 个工具的 schema 传入`tool_schemas`，由 LLM 根据系统提示自主决策是否拆解任务、何时执行工具。
+2. **典型自主规划执行流**
+   - 步骤 1：LLM 识别目标复杂度，调用`task_create`批量创建带依赖关系的任务清单。
+   - 步骤 2：LLM 调用`task_update`标记任务为进行中，调用对应执行工具完成任务内容。
+   - 步骤 3：LLM 标记任务为已完成，TaskManager 自动解锁下游依赖任务。
+   - 循环往复，直至所有任务完成，LLM 输出最终总结结果。
+3. **事件体系兼容**
+所有任务操作均通过原有`tool_call_start/tool_call_finished`事件对外广播，**不新增独立的任务领域事件**。CLI 与 TUI 无需改造，可直接通过事件流观测规划全过程。
+
+## 其他效果优化
+
+### TUI改版：单列终端滚动流
+整个界面为一个`verticalScroll`容器，事件进来时动态追加到wiget,始终自动滚动到底部。
+
+### LLM流式输出的原地积累
+
+每到一个token,self._text追加，然后用新字符串刷新widget显示。流结束时（收到非token事件)，finalize_markdown()把累积的文本整体渲染成Markdown,代码块、列表、粗体都正确显示。
+
+**为什么不每个token追加一个widget?**
+如果每个token都mount一个新widget,一次LLM回复可能产生几百个widget对象，Textual的布局引擎需要反复计算整个wⅵdget树的高度和位置，帧率会显著下降，长输出时肉眼可见地卡顿。update()在原地替换内容，布局引擎只需要重绘这一个widget,代价小得多。current1lm是当前"活跃"的LLMStreamBlock引用。当收到任何非token事件时，break1lm()调用finalize markdown()并把引用置为None:下一个token到来时会新建一个LLMStreamBlock,形成一个新的文字块。LLM在不同step里的思考内容在视觉上是分隔的，不会混在一起。
+
+### 工具调用块的折叠展开
+
+工具调用频繁，但只用关心其是否成功。全部展开会淹没llm思考与输出结果，全部折叠又无法了解调用细节。解决方法是：默认折叠，点击展开。
+.detail这个子widget默认是display:none-存在于DOM里，但不占空间、不显示。给父widget加上expanded类后，CSS规则ToolCallBlock.expanded>.detail{display:block;}立即生效，detail出现。折叠/展开是纯CSS切换，不需要mount/remove widget,.也不需要重新布局整棵树，只是修改显示属性。点击行为很流畅。工具出错时，摘要行的颜色变红，折叠状态下就能看到出了什么问题一不需要展开细节。工具输出通过ToolCallFinishedEvent.output字段传递给TUI。s3在这个event上新增了output:str字段，invoke_tool()在publish之前把result.content塞进去，这样TUI能直接从事件里拿到工具输出，不需要回查events.jsonl。
+
+## 六、设计原则与验收标准
+
+### 设计约束
+
+- **向后兼容**：原有单步执行模式完全保留，简单目标 LLM 可直接执行，无需强制拆解任务。
+- **LLM 友好**：整数 ID、紧凑状态格式、自动依赖清理，最大化降低 LLM 调用错误率与认知负担。
+- **数据隔离**：不同 run 的任务数据完全隔离，任务文件随 run 持久化，可回溯任意历史 run 的规划过程。
+- **极简内核**：TaskManager 仅做数据持久化，所有规划决策、流程控制全部下沉给 LLM，避免重复造轮子。
+
+### 验收用例
+
+执行命令：
+
+```
+uv run manius run --goal "分析当前项目代码结构并生成结构说明文件"
+```
+
+验收标准：
+
+1. Agent 自主拆解任务、设置依赖，无需人工干预即可完成全流程。
+2. 任务完成时自动解锁下游依赖，状态流转正确。
+3. TUI/CLI 可通过事件流观测到完整的任务创建、执行、完成过程。
+4. run 目录下生成`.tasks`文件夹，包含完整的任务 JSON 文件，可直接查看规划历史。
