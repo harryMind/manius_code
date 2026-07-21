@@ -72,6 +72,34 @@ class RecoveringAnthropicProvider:
         )
 
 
+class FileDeliveryProvider:
+    # 初始化调用计数并保存模型收到的文件交付反馈。
+    def __init__(self) -> None:
+        self._calls = 0
+        self.feedback_messages: list[dict] = []
+
+    # 先模拟空回答，再写入快速排序文件并在下一轮完成任务。
+    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
+        self._calls += 1
+        if self._calls == 1:
+            return LlmResponse(text="", tool_calls=[], assistant_content=[{"type": "text", "text": ""}])
+        if self._calls == 2:
+            self.feedback_messages = messages
+            return _tool_response(
+                "write-quicksort-1",
+                "write_file",
+                {
+                    "path": "tests/learning/quicksort.py",
+                    "content": "def quicksort(values: list[int]) -> list[int]:\n    return sorted(values)\n",
+                },
+            )
+        return LlmResponse(
+            text="Created tests/learning/quicksort.py.",
+            tool_calls=[],
+            assistant_content=[{"type": "text", "text": "Created tests/learning/quicksort.py."}],
+        )
+
+
 # 构造包含标准 tool_use 内容块的确定性工具调用响应。
 def _tool_response(call_id: str, name: str, arguments: dict) -> LlmResponse:
     return LlmResponse(
@@ -183,6 +211,29 @@ def test_agent_runner_recovers_from_tool_failure_by_returning_error_to_provider(
     assert len(tool_results) == 1
     assert tool_results[0]["tool_use_id"] == "missing-read-1"
     assert tool_results[0]["content"].startswith("Tool 'read_file' failed: file not found:")
+
+
+# 功能：验证文件交付目标在空回答后不会被误判成功，并会驱动模型写入并验证目标文件。
+# 设计：替身先返回无工具响应，再根据运行器反馈调用真实 write_file，以覆盖完成条件与文件存在性校验。
+def test_agent_runner_requires_verified_write_before_completing_file_delivery_goal(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = FileDeliveryProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus, _tools: provider,
+    )
+
+    summary = asyncio.run(runner.run("Write a quicksort implementation to tests/learning/quicksort.py."))
+    target = tmp_path / "tests" / "learning" / "quicksort.py"
+
+    assert summary.status == "success"
+    assert target.read_text(encoding="utf-8").startswith("def quicksort")
+    assert any(
+        message["content"].startswith("The goal requires a workspace file")
+        for message in provider.feedback_messages
+        if message["role"] == "user" and isinstance(message["content"], str)
+    )
 
 
 # 功能：验证达到最大步数会将统一上下文状态标记为失败并输出失败原因。

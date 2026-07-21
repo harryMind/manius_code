@@ -29,6 +29,10 @@ class ExecutionContext(BaseModel):
             }
         )
 
+    # 将无法匹配工具调用的执行反馈作为普通用户消息补充到下一轮上下文。
+    def add_user_feedback(self, feedback: str) -> None:
+        self.messages.append({"role": "user", "content": feedback})
+
     # 将运行中的任务标记为成功并保存最终结果。
     def mark_success(self, result: str = "") -> None:
         if self.status != "running":
