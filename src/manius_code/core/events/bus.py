@@ -21,9 +21,12 @@ class EventBus:
     async def publish(self, event: AgentEvent) -> None:
         if self._tracer is not None:
             self._tracer.emit(
-                "core_event",
+                "CORE",
+                "event",
+                event.type,
                 event.model_dump(mode="json"),
                 run_id=event.run_id,
+                step=event.step,
             )
         for subscriber in self._subscribers:
             result = subscriber(event)
