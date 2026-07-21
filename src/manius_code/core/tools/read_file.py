@@ -1,9 +1,12 @@
-from pathlib import Path
+import codecs
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from manius_code.core.tools.invocation import ToolExecutionError
+from manius_code.core.tools.paths import resolve_workspace_path
+
+_MAX_READ_BYTES = 512 * 1024
 
 
 class ReadFileArguments(BaseModel):
@@ -25,11 +28,20 @@ class ReadFileTool:
     # 读取 UTF-8 文本文件并转换底层异常为工具错误。
     async def execute(self, arguments: dict[str, Any]) -> str:
         try:
-            path = Path(ReadFileArguments.model_validate(arguments).path)
+            path = resolve_workspace_path(ReadFileArguments.model_validate(arguments).path)
         except ValidationError as error:
             raise ToolExecutionError(self.name, "requires a valid 'path' string") from error
+        except ValueError as error:
+            raise ToolExecutionError(self.name, str(error)) from error
         try:
-            return path.read_text(encoding="utf-8")
+            with path.open("rb") as file:
+                content = file.read(_MAX_READ_BYTES + 1)
+            truncated = len(content) > _MAX_READ_BYTES
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+            text = decoder.decode(content[:_MAX_READ_BYTES], final=not truncated)
+            if truncated:
+                return f"{text}\n\n[truncated: file exceeds 512KB]"
+            return text
         except FileNotFoundError as error:
             raise ToolExecutionError(self.name, f"file not found: {path}") from error
         except IsADirectoryError as error:

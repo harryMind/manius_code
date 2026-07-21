@@ -34,6 +34,46 @@ class FailingAnthropicProvider:
         raise RuntimeError("Provider request failed")
 
 
+# 构造包含标准 tool_use 内容块的确定性工具调用响应。
+def _tool_response(call_id: str, name: str, arguments: dict) -> LlmResponse:
+    return LlmResponse(
+        text="Planning the next task.",
+        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
+        assistant_content=[{"type": "tool_use", "id": call_id, "name": name, "input": arguments}],
+    )
+
+
+class AutonomousPlanningProvider:
+    # 初始化确定性规划步骤并保存运行器注入的工具定义名称。
+    def __init__(self) -> None:
+        self._calls = 0
+        self.tool_names: set[str] = set()
+
+    # 记录运行器提供的工具定义后返回同一 Provider 替身。
+    def with_tool_definitions(self, definitions: list[dict]) -> "AutonomousPlanningProvider":
+        self.tool_names = {definition["name"] for definition in definitions}
+        return self
+
+    # 模拟创建依赖任务、执行任务并输出最终交付结果的完整规划流程。
+    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
+        self._calls += 1
+        calls = [
+            ("create-1", "task_create", {"subject": "Inspect repository"}),
+            ("create-2", "task_create", {"subject": "Write structure report", "blocked_by": [1]}),
+            ("update-1", "task_update", {"task_id": 1, "status": "completed"}),
+            ("update-2", "task_update", {"task_id": 2, "status": "in_progress"}),
+            ("write-1", "write_file", {"path": "structure.md", "content": "# Structure\n"}),
+            ("update-3", "task_update", {"task_id": 2, "status": "completed"}),
+        ]
+        if self._calls <= len(calls):
+            return _tool_response(*calls[self._calls - 1])
+        return LlmResponse(
+            text="Repository structure report completed.",
+            tool_calls=[],
+            assistant_content=[{"type": "text", "text": "Repository structure report completed."}],
+        )
+
+
 # 功能：验证 AgentRunner 会执行读文件、持久化事件并完成多轮任务。
 # 设计：注入确定性 Claude 替身，覆盖 plan-act-observe 和 events.jsonl，而不依赖外部 API。
 def test_agent_runner_persists_end_to_end_events(tmp_path: Path, monkeypatch) -> None:
@@ -112,3 +152,34 @@ def test_agent_runner_does_not_print_local_events(tmp_path: Path, capsys) -> Non
     assert summary.status == "failed"
     assert capsys.readouterr().out == ""
     assert json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])["type"] == "run_finished"
+
+
+# 功能：验证运行器为每次任务注册八个工具，并由 Agent 自主完成带依赖的任务规划和交付。
+# 设计：以确定性 Provider 串联创建、解锁、执行与完成操作，直接断言 run 私有 .tasks 文件和最终产物。
+def test_agent_runner_executes_autonomous_task_plan_in_isolated_run_directory(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = AutonomousPlanningProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=7),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus, definitions: provider.with_tool_definitions(definitions),
+    )
+
+    summary = asyncio.run(runner.run("Analyze the repository and generate a structure report."))
+    tasks_dir = tmp_path / "runs" / summary.run_id / ".tasks"
+    second_task = json.loads((tasks_dir / "task_2.json").read_text(encoding="utf-8"))
+
+    assert provider.tool_names == {
+        "task_create",
+        "task_update",
+        "task_list",
+        "task_get",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "bash",
+    }
+    assert summary.status == "success"
+    assert (tmp_path / "structure.md").read_text(encoding="utf-8") == "# Structure\n"
+    assert second_task["status"] == "completed"
+    assert second_task["blocked_by"] == []

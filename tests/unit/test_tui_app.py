@@ -17,7 +17,7 @@ def test_tui_displays_brand_header_and_scrollable_event_view() -> None:
     async def exercise() -> None:
         app = ManiusTui(ManiusConfig(host="127.0.0.1", port=7437))
         async with app.run_test():
-            assert _MANIUSCODE_LOGO.startswith("███ ███")
+            assert _MANIUSCODE_LOGO.startswith("███╗")
             assert app.query_one("#banner", Static) is not None
             assert app.query_one("#header", Static).render() == "maniuscode  127.0.0.1:7437  connecting  global"
             assert app.query_one("#log-view", VerticalScroll) is not None
@@ -62,6 +62,10 @@ def test_tui_updates_tool_call_block_in_place() -> None:
             assert ("run-a", "read_file") not in app._tool_blocks
             assert block._duration_ms == 5
             assert block._error is None
+            assert block._result == "content"
+            block.on_click()
+            assert block._expanded is True
+            assert "output:" in str(block.render())
 
     asyncio.run(exercise())
 

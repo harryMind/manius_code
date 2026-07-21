@@ -13,10 +13,14 @@ from manius_code.core.events.bus import EventBus, Subscriber
 from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.tasks.manager import TaskManager
 from manius_code.core.tracing import TracingProvider
+from manius_code.core.tools.bash import BashTool
+from manius_code.core.tools.file_tools import ListDirTool, WriteFileTool
 from manius_code.core.tools.invocation import ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
 from manius_code.core.tools.registry import ToolRegistry
+from manius_code.core.tools.task_tools import TaskCreateTool, TaskGetTool, TaskListTool, TaskUpdateTool
 
 
 class RunSummary(BaseModel):
@@ -50,6 +54,7 @@ class AgentRunner:
         run_id = run_id or uuid4().hex
         run_dir = self._runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
+        task_manager = TaskManager(run_dir / ".tasks")
 
         # 全局事件总线
         event_bus = EventBus(self._tracer)
@@ -68,8 +73,14 @@ class AgentRunner:
 
         # 注册工具
         tools = ToolRegistry()
-        # s1 仅读取文件工具
+        tools.register(TaskCreateTool(task_manager))
+        tools.register(TaskUpdateTool(task_manager))
+        tools.register(TaskListTool(task_manager))
+        tools.register(TaskGetTool(task_manager))
         tools.register(ReadFileTool())
+        tools.register(WriteFileTool())
+        tools.register(ListDirTool())
+        tools.register(BashTool())
         tool_invoker = ToolInvoker(tools, event_bus, run_id, lambda: context.step)
 
         # llm绑定事件总线与工具注册表

@@ -22,7 +22,7 @@ from manius_code.core.transport.socket_client import IpcError, SocketClient
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 _RETRY_DELAY_SECONDS = 2
 _TOKEN_FLUSH_INTERVAL_SECONDS = 0.08
-_MANIUSCODE_LOGO = """
+_MANIUSCODE_LOGO = """\
 ███╗   ███╗ █████╗ ███╗   ██╗██╗██╗   ██╗███████╗███████╗ ██████╗ ███████╗ ███████╗
 ████╗ ████║██╔══██╗████╗  ██║██║██║   ██║██╔════╝██╔════╝██╔═══██╗██╔══ ██║██╔════╝
 ██╔████╔██║███████║██╔██╗ ██║██║██║   ██║███████╗██║     ██║   ██║██║   ██║█████╗  
@@ -68,6 +68,7 @@ class ToolCallBlock(Static):
     """A compact tool-call row that changes state in place."""
 
     DEFAULT_CSS = "ToolCallBlock { padding: 0 2; color: $text-muted; }"
+    can_focus = True
 
     # 初始化工具调用摘要及其等待完成的状态。
     def __init__(self, tool_name: str, arguments: dict[str, Any]) -> None:
@@ -75,6 +76,8 @@ class ToolCallBlock(Static):
         self._arguments = arguments
         self._duration_ms: int | None = None
         self._error: str | None = None
+        self._result: str | None = None
+        self._expanded = False
         super().__init__(self._render())
 
     # 根据工具状态生成一行带颜色的摘要文本。
@@ -92,12 +95,31 @@ class ToolCallBlock(Static):
         else:
             text.append(f"  failed  {self._duration_ms}ms", style="red")
             text.append(f"  {_preview(self._error)}", style="red")
+        if self._expanded:
+            text.append("\n    arguments: ", style="dim")
+            text.append(json.dumps(self._arguments, ensure_ascii=False, default=str), style="dim")
+            if self._result is not None:
+                text.append("\n    output:\n", style="dim")
+                text.append(self._result)
+            if self._error is not None:
+                text.append("\n    error: ", style="red")
+                text.append(self._error, style="red")
+            text.append("\n    click to collapse", style="dim")
+        else:
+            text.append("  click for details", style="dim")
         return text
 
     # 将工具调用更新为成功或失败的最终状态。
-    def finish(self, duration_ms: int, error: str | None = None) -> None:
+    def finish(self, duration_ms: int, error: str | None = None, result: str | None = None) -> None:
         self._duration_ms = duration_ms
         self._error = error
+        self._result = result
+        self.update(self._render())
+
+    # 点击摘要行时切换完整参数与工具输出的可见状态。
+    def on_click(self) -> None:
+        self._expanded = not self._expanded
+        self.set_class(self._expanded, "expanded")
         self.update(self._render())
 
 
@@ -249,7 +271,7 @@ class ManiusTui(App[None]):
                 self._tool_blocks[(event.run_id, event.tool_name)] = block
                 self._append(block)
             case "tool_call_success":
-                self._finish_tool(event.run_id, event.tool_name, event.duration_ms)
+                self._finish_tool(event.run_id, event.tool_name, event.duration_ms, result=event.result)
             case "tool_call_failed":
                 self._finish_tool(event.run_id, event.tool_name, event.duration_ms, event.error)
             case "run_finished":
@@ -286,14 +308,21 @@ class ManiusTui(App[None]):
         self._stream_blocks.clear()
 
     # 将指定工具调用块更新为成功或失败状态。
-    def _finish_tool(self, run_id: str, tool_name: str, duration_ms: int, error: str | None = None) -> None:
+    def _finish_tool(
+        self,
+        run_id: str,
+        tool_name: str,
+        duration_ms: int,
+        error: str | None = None,
+        result: str | None = None,
+    ) -> None:
         block = self._tool_blocks.pop((run_id, tool_name), None)
         if block is None:
             status = "failed" if error else "done"
             detail = f": {error}" if error else ""
             self._append(Static(f"  tool {tool_name}  {status}  {duration_ms}ms{detail}", classes="log-line"))
             return
-        block.finish(duration_ms, error)
+        block.finish(duration_ms, error, result)
 
     # 生成任务成功或失败的收尾组件。
     def _run_finished_widget(self, event: RunFinishedEvent) -> Static:
