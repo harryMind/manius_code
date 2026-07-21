@@ -2,7 +2,7 @@ from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import StepDoneEvent, StepPlanningEvent
 from manius_code.core.llm.anthropic import AnthropicProvider
-from manius_code.core.tools.invocation import ToolInvoker
+from manius_code.core.tools.invocation import ToolExecutionError, ToolInvoker
 
 
 class AgentLoop:
@@ -51,7 +51,10 @@ class AgentLoop:
                     )
                     return self._context.result
                 for tool_call in response.tool_calls:
-                    result = await self._tool_invoker.invoke(tool_call.name, tool_call.arguments)
+                    try:
+                        result = await self._tool_invoker.invoke(tool_call.name, tool_call.arguments)
+                    except ToolExecutionError as error:
+                        result = f"Tool '{error.tool_name}' failed: {error.message}"
                     self._context.add_tool_result(tool_call.id, result)
                 await self._event_bus.publish(
                     StepDoneEvent(
