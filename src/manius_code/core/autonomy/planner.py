@@ -99,9 +99,11 @@ class StructuredAutonomyProvider:
         return await self._request(
             run_id,
             step,
-            "You are the Resolver. Return JSON only, with no markdown and no tool calls. Use retry for a transient or correctable "
-            "action failure, revise_step when the existing step needs correction, replan when dependencies are invalid, and abort only "
-            "when the goal cannot be safely completed. A replan decision must include a complete PlanProposal.",
+            "You are the Resolver. Return JSON only, with no markdown and no tool calls. Use retry for a transient tool failure, "
+            "revise_step when the current step or its acceptance criteria are wrong, replan when dependencies are invalid, and abort "
+            "only when the goal cannot be safely completed. A revise_step decision must include revised_step with the same id. A replan "
+            "decision must include a complete PlanProposal. When only the acceptance criterion was wrong, revise it to match the existing "
+            "successful tool observation so the runtime can verify it without executing the tool again.",
             {
                 "goal": goal,
                 "plan_step": plan_step.model_dump(mode="json"),

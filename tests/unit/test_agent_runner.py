@@ -186,6 +186,55 @@ class ReplanningProvider:
         return "Replacement artifact delivered."
 
 
+class RevisingCriteriaProvider:
+    # 提供一个会在首次验收失败后仅修订验收条件的目录检查计划。
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="inspect",
+                    title="Inspect workspace",
+                    allowed_tools=["list_dir"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="not-present")],
+                )
+            ],
+        )
+
+    # 为目录检查步骤返回唯一的只读工具动作。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        return ActionProposal(step_id=plan_step.id, tool_name="list_dir", arguments={"path": ".", "max_depth": 0})
+
+    # 用同一步骤标识修订错误的验收字符串，使现有工具输出可被直接重新验证。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        return ResolverDecision(
+            action="revise_step",
+            reason="the directory listing already proves the expected file exists",
+            revised_step=plan_step.model_copy(
+                update={"acceptance_criteria": [AcceptanceCriterion(kind="tool_result_contains", expected="README.md")]}
+            ),
+        )
+
+    # 返回通过既有观察结果验证后的稳定摘要。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "Existing observation verified after criteria revision."
+
+
 class InvalidPlanProvider:
     # 生成含循环依赖的非法 DAG 以验证审计层不会让它进入执行层。
     async def plan(
@@ -300,6 +349,31 @@ def test_agent_runner_replaces_plan_after_resolver_replan(tmp_path: Path, monkey
     assert (plan_dir / "plan.v1.json").is_file()
     assert (plan_dir / "plan.v2.json").is_file()
     assert "plan_revised" in event_types
+
+
+# 功能：验证 revise_step 会持久化修订计划并使用已有成功工具结果重新验收，不重复执行同一个工具动作。
+# 设计：先构造必然不匹配的文本验收条件，再由替身仅修订条件，断言执行步数与 tool_call_start 均为一次。
+def test_agent_runner_reuses_observation_after_revising_acceptance_criteria(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# Read me\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = AgentRunner(
+        ManiusConfig(max_steps=2),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: RevisingCriteriaProvider(),
+    )
+
+    summary = asyncio.run(runner.run("Inspect README"))
+    run_dir = tmp_path / "runs" / summary.run_id
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    state = json.loads((run_dir / "plan" / "state.json").read_text(encoding="utf-8"))
+
+    assert summary.status == "success"
+    assert summary.total_steps == 1
+    assert (run_dir / "plan" / "plan.v2.json").is_file()
+    assert state["version"] == 2
+    assert state["steps"][0]["status"] == "succeeded"
+    assert [event["type"] for event in events].count("tool_call_start") == 1
+    assert "plan_revised" in [event["type"] for event in events]
 
 
 # 功能：验证 Auditor 会拒绝循环依赖计划，且不会注册或调用旧 TaskManager 与直接工具调用路径。

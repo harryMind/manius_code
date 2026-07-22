@@ -68,3 +68,4 @@ class ResolverDecision(BaseModel):
     action: ResolverAction
     reason: str
     plan: PlanProposal | None = None
+    revised_step: PlanStep | None = None
