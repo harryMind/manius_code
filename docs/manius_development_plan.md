@@ -470,3 +470,207 @@ uv run manius run --goal "分析当前项目代码结构并生成结构说明文
 2. 任务完成时自动解锁下游依赖，状态流转正确。
 3. TUI/CLI 可通过事件流观测到完整的任务创建、执行、完成过程。
 4. run 目录下生成`.tasks`文件夹，包含完整的任务 JSON 文件，可直接查看规划历史。
+
+## S4-Advance：五层闭环自主规划（开发提示词）
+
+### 阶段定位
+
+在 S3 的 daemon、IPC、事件广播、TUI 观测和全链路 Trace 基础上，将当前 S4 的“LLM 直接调用 `task_*` 工具管理任务”升级为五层闭环自主规划架构。目标是让用户只提供高层目标，系统自动完成：
+
+```text
+目标 → 规划 → 审计 → 调度/执行 → 验证 → 反思/修复 → 计划修订 → 总结/记忆沉淀
+```
+
+五层是职责边界，不是五个独立进程或五套 LLM 客户端。Planner、步骤动作推理和 Resolver 可复用同一个 `AnthropicProvider`；Auditor、Scheduler、Verifier、状态机和持久化必须由确定性代码实现。
+
+所有新增核心代码必须位于 `src/manius_code/core/`，顶层包仍只保留 `cli`、`core`、`tui`。保留 `agent.run`、现有 JSON-RPC/SocketClient、EventBus、IpcEventBroadcaster、Trace、CLI 和 TUI 的公开接口与行为。
+
+### 设计原则与强制约束
+
+1. **LLM 只做推理**：LLM 只能提交经 Pydantic 校验的计划提案、动作提案和修复提案；不得直接拥有步骤状态控制权或执行副作用。
+2. **机器规则兜底**：只有 Supervisor、Auditor、Executor 与 Verifier 能改变权威步骤状态；只有所有必需步骤验收通过后，才能发布 `RunFinishedEvent(status="success")`。
+3. **禁止自然语言关键词补丁**：不得新增类似 `_requires_file_output(goal)` 的目标文本特判。交付物、验收条件、允许工具和风险限制必须来自结构化 `PlanStep`。
+4. **复用而非复制**：复用 `AgentRunner` 的 run 生命周期、`ExecutionContext` 的短期上下文、`ToolRegistry`/`ToolInvoker` 的唯一工具执行入口、EventBus/IPC/Trace 观测链路，以及 `TaskManager` 的 run 隔离 JSON 持久化和依赖处理能力。
+5. **无隐式副作用**：文件写入、命令执行等动作必须先经 Auditor 审计，再通过 `ToolInvoker.invoke()` 执行。Planner、Resolver、Store 不得直接调用工具。
+6. **计划版本不可覆盖**：每次重规划产生新版本；不得创建与现有 `.tasks` 平行且不一致的第二套任务状态目录。
+7. **复杂度自适应**：简单目标可生成单步骤计划，复杂目标才生成 DAG。是否规划由确定性复杂度策略决定，不能仅依赖 LLM 是否“自觉”调用 `task_create`。
+
+### 五层职责
+
+| 层 | 输入 | 输出 | 责任边界 |
+| --- | --- | --- | --- |
+| Planner | `GoalSpec`、相关记忆、当前计划摘要 | `PlanProposal` | 分层拆解任务、生成 DAG、声明交付物与验收条件；不执行工具、不写状态。 |
+| Auditor | `PlanProposal`、`PlanPatch`、`ActionProposal`、策略 | `AuditResult` | 校验 DAG、工具权限、路径、预算、风险和验收条件；拒绝非法提案。 |
+| Executor | 已批准计划、ready 步骤 | `StepResult`、`Artifact` | 调度步骤、请求步骤范围内的动作提案、复用 ToolInvoker 执行、记录事实。 |
+| Resolver | 失败 `StepResult`、步骤上下文、记忆 | `ResolverDecision` | 提议 `retry`、`revise_step`、`replan` 或 `abort`；修订必须再次审计。 |
+| Memory | 已验证 run 摘要、计划、失败和产物 | `MemoryContext`、`MemoryRecord` | 在规划/修复前提供压缩经验，结束后仅沉淀已验证结论。 |
+
+`Verifier` 是 Executor 的必需子职责：它验证文件、测试、命令和显式产物；没有验收证据，任何步骤都不能进入成功状态。
+
+### 建议模块结构
+
+```text
+src/manius_code/core/
+  agent/
+    runner.py              # 保留：run 生命周期与依赖装配
+    context.py             # 保留：单 run 短期消息上下文
+    loop.py                # 逐步迁移为兼容层，不再承担全局状态机
+
+  autonomy/
+    contracts.py           # GoalSpec、Plan、PlanStep、ActionProposal 等 Pydantic 模型
+    supervisor.py          # 五层闭环的唯一状态机与结束判定
+    planner.py             # Planner 的结构化 LLM 调用适配
+    auditor.py             # 计划与动作的确定性规则审计
+    scheduler.py           # 基于依赖与状态选择 ready 步骤
+    executor.py            # 单步骤动作循环，复用 ToolInvoker
+    verifier.py            # 文件、命令、测试和声明产物的验收
+    resolver.py            # 失败反思、有限重试、计划修订提案
+    store.py               # PlanStore：计划版本和步骤状态持久化门面
+    policy.py              # 工具权限、预算、风险和重试策略
+
+  memory/
+    contracts.py           # MemoryRecord、MemoryContext
+    working.py             # ExecutionContext 的压缩摘要策略
+    episodic.py            # run 历史的结构化经验读写
+    project.py             # workspace 隔离的稳定项目知识
+    retrieval.py           # 检索、排序、截断记忆
+```
+
+不要复制 `TaskManager`。通过 `PlanStore` 门面逐步扩展并复用其文件隔离、JSON 读写、自增 ID 与依赖处理能力。保留现有 `task_*` 工具用于兼容和查看历史 `.tasks`；新 Supervisor 路径不得依赖 LLM 直接调用这些工具改变权威状态。
+
+### 结构化契约和状态机
+
+所有契约放入 `core/autonomy/contracts.py`，并在各边界使用 `model_validate`。最低模型集合：
+
+```text
+GoalSpec
+  goal, workspace, required_artifacts, constraints
+
+Plan
+  plan_id, version, goal, steps, created_at
+
+PlanStep
+  id, title, description, dependencies, status,
+  acceptance_criteria, allowed_tools, artifacts,
+  attempt_count, last_error
+
+ActionProposal
+  step_id, tool_name, arguments, rationale
+
+StepResult
+  step_id, attempt, observations, artifacts, verification, error
+
+ResolverDecision
+  action: retry | revise_step | replan | abort,
+  reason, patch, retry_arguments
+```
+
+步骤状态至少为：
+
+```text
+pending → ready → running → verifying → succeeded
+                                  ├→ retryable
+                                  ├→ replan_required
+                                  └→ failed
+```
+
+状态转移由 `AutonomousSupervisor` 和 `PlanStore` 强制校验。Planner 和 Resolver 仅能提议；Verifier 产出验收证据后，Supervisor 才能写入 `succeeded`。
+
+### 闭环执行要求
+
+```text
+Memory.retrieve
+  → Planner.propose
+  → Auditor.approve_plan
+  → PlanStore.persist(version)
+  → Scheduler.next_ready_step
+  → Executor.execute_step
+  → Verifier.verify
+  → 成功：更新步骤并继续调度
+  → 失败：Resolver.decide → Auditor.approve_patch → PlanStore.persist(next version)
+  → 全部必需步骤验证成功：Memory.record → RunFinished(success)
+```
+
+#### Planner
+
+- 输出 `PlanProposal`，不得调用 `task_create` 修改状态。
+- 每个步骤必须有输入、依赖、允许工具、显式产物和可机器验证的 `acceptance_criteria`。
+- 复用 `AnthropicProvider` 的流式调用、事件发布和 Trace；增加受限结构化推理接口或 schema，不创建平行 LLM 客户端。
+
+#### Auditor
+
+- 审计计划：DAG 无环、步骤 ID 唯一、依赖存在且无自依赖、验收条件完整、允许工具已注册。
+- 审计动作：动作必须属于当前 ready 步骤的允许工具，参数满足 schema，路径留在 workspace，命令/写入符合安全策略。
+- 审计资源：限制步骤数、每步重试次数、总工具调用、总 LLM 调用和计划版本数，防止无限循环。
+- 审计失败必须给出结构化原因，不能静默修正或绕过。
+
+#### Executor 与 Verifier
+
+- Scheduler 只能从所有依赖成功的步骤中确定性选择 `ready` 步骤。
+- Executor 在步骤作用域内向 LLM 请求 `ActionProposal`，审计通过后复用唯一的 `ToolInvoker` 执行。
+- 保留既有 `ToolCallStartEvent`、`ToolCallSuccessEvent`、`ToolCallFailedEvent` 和 Trace；不得创建第二套工具事件或传输通道。
+- Verifier 根据 `acceptance_criteria` 做通用验证，初期至少支持文件存在/内容断言、命令退出码、测试命令、工具结果断言和显式产物清单。
+- 工具失败或验收失败进入 `retryable` 或 `replan_required`，不得直接让 run 成功或失败。
+
+#### Resolver
+
+- 输入失败事实、工具错误、当前步骤、计划摘要、预算和相关记忆，而非只有自由文本错误。
+- 仅输出 `retry`、`revise_step`、`replan`、`abort` 四种受限决策。
+- `retry` 必须受每步预算限制；`revise_step`/`replan` 形成 `PlanPatch`，经 Auditor 后创建新计划版本；历史版本只读保留。
+- 达到预算、不可恢复错误或审计拒绝后，以明确 `reason` 失败结束。
+
+#### Memory
+
+- 工作记忆：复用 `ExecutionContext`，定期生成摘要，避免把原始工具输出无限追加到上下文。
+- 情景记忆：保存已完成 run 的目标、批准计划、失败类型、有效修复、验收结果和最终摘要。
+- 项目记忆：按 workspace 隔离，保存经验证的目录规则、Shell 约束、测试命令和工具偏好。
+- 初期使用 JSON/JSONL 或现有 run 文件进行结构化检索；不强制引入向量数据库。只有通过 Verifier 或用户确认的事实才能进入长期记忆。
+
+### 持久化、事件与界面
+
+每个 run 在既有 `runs/<run_id>/events.jsonl` 外保存：
+
+```text
+runs/<run_id>/
+  events.jsonl
+  plan/
+    plan.v1.json
+    plan.v2.json
+    state.json
+    attempts.jsonl
+  summary.json
+```
+
+新增领域事件统一定义在 `core/bus/events.py`，并复用 `EventBus → IpcEventBroadcaster → EventPushEnvelope`：
+
+```text
+plan_proposed, plan_approved, plan_rejected,
+step_ready, step_started, step_verified, step_retrying,
+plan_revised, memory_recalled, memory_recorded
+```
+
+CLI 不新增平行执行路径。TUI 作为主前端，应展示当前计划版本、步骤状态、失败原因、重试次数和验收结果，同时保留日志流与工具详情。
+
+### 迁移顺序
+
+1. 实现契约、PlanStore、状态机与计划版本持久化，为 `TaskManager` 提供迁移适配。
+2. 实现 Planner + Auditor，完成 DAG 校验、复杂度策略和计划批准事件。
+3. 实现 Scheduler + Executor + Verifier，将当前 AgentLoop 收敛为单步骤执行器并落地通用验收门禁。
+4. 加入 Resolver，完成失败分类、有限重试、计划修订与预算终止。
+5. 加入 working/episodic/project 三层结构化记忆与检索；之后再评估向量检索。
+6. 完成 TUI 计划视图、恢复/回放能力，并清理仅服务旧 S4 关键词补丁的逻辑。
+
+每一步必须可以独立运行全量测试；不得一次性替换 AgentLoop。旧 S4 的 `task_*`、历史 `.tasks` 文件及 S2/S3 daemon 协议必须保持可读取、可观测和向后兼容。
+
+### 验收标准与测试要求
+
+1. 复杂目标能生成经审计的无环 DAG；每一步均有依赖、允许工具和验收条件。
+2. LLM 的空响应、无工具调用或主观“完成”声明，不能使未验收任务成功结束。
+3. Scheduler 只执行依赖已满足的步骤；非法状态转移产生明确错误并保留历史状态。
+4. 文件、测试、命令等交付由结构化验收条件验证，而不是目标文本关键词特判。
+5. Resolver 可在预算内重试或提交经审计的计划修订；超过预算时以明确原因失败。
+6. 中断后可从 run 目录回放计划版本、步骤状态、尝试与验收证据。
+7. 记忆按 workspace 隔离，只有已验证事实进入项目记忆，检索不会无限膨胀上下文。
+8. 现有 `agent.run`、事件订阅/回放、CLI、TUI 与 S3 Trace 回归全部通过。
+
+测试至少覆盖：DAG 环检测、状态机、动作审计、路径/工具权限、Verifier、Resolver 预算、Memory 隔离；确定性 LLM 替身覆盖计划批准、依赖调度、失败重试、计划修订、未验收交付拒绝；以及 daemon 事件、Trace、重连回放和 TUI 计划状态的集成回归。
