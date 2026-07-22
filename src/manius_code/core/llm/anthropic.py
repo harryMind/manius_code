@@ -39,7 +39,14 @@ class AnthropicProvider:
         self._tracer = tracer
 
     # 向 Anthropic 发送上下文并将响应转换为 Agent 可处理结构。
-    async def complete(self, run_id: str, step: int, messages: list[dict[str, Any]]) -> LlmResponse:
+    async def complete(
+        self,
+        run_id: str,
+        step: int,
+        messages: list[dict[str, Any]],
+        system_instruction: str | None = None,
+        emit_tokens: bool = True,
+    ) -> LlmResponse:
         await self._event_bus.publish(LlmRequestEvent(run_id=run_id, step=step, messages=messages))
         client = self._client or self._create_client()
         self._client = client
@@ -48,7 +55,7 @@ class AnthropicProvider:
         request_payload = {
             "model": self._config.default_model,
             "max_tokens": 4096,
-            "system": (
+            "system": system_instruction or (
                 "You are a helpful AI assistant. Use the available tools to complete the user's goal. "
                 "For multi-step work, first create a concise task plan with task_create, express task "
                 "dependencies with integer IDs, and use task_list to decide what is unblocked. Update a "
@@ -75,7 +82,8 @@ class AnthropicProvider:
             )
         async with client.messages.stream(**request_payload) as stream:
             async for token in stream.text_stream:
-                await self._event_bus.publish(LlmTokenEvent(run_id=run_id, step=step, token=token))
+                if emit_tokens:
+                    await self._event_bus.publish(LlmTokenEvent(run_id=run_id, step=step, token=token))
             response = await stream.get_final_message()
         if self._tracer is not None:
             response_payload = self._response_payload(response)

@@ -2,303 +2,303 @@ import asyncio
 import json
 from pathlib import Path
 
-from manius_code.core.config import ManiusConfig
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.llm.anthropic import LlmResponse, ToolCall
+from manius_code.core.autonomy.contracts import (
+    AcceptanceCriterion,
+    ActionProposal,
+    PlanProposal,
+    PlanStep,
+    ResolverDecision,
+    StepResult,
+)
+from manius_code.core.config import ManiusConfig
+from manius_code.core.events.bus import EventBus
 
 
-class FakeAnthropicProvider:
-    # 记录调用次数以模拟一次读文件和一次最终回答。
-    def __init__(self) -> None:
-        self._calls = 0
-
-    # 依次返回工具调用和最终文本响应。
-    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
-        self._calls += 1
-        if self._calls == 1:
-            return LlmResponse(
-                text="I will inspect the file.",
-                tool_calls=[ToolCall(id="read-1", name="read_file", arguments={"path": "README.md"})],
-                assistant_content=[{"type": "tool_use", "id": "read-1", "name": "read_file", "input": {"path": "README.md"}}],
-            )
-        return LlmResponse(
-            text="README summary complete.",
-            tool_calls=[],
-            assistant_content=[{"type": "text", "text": "README summary complete."}],
-        )
-
-
-class FailingAnthropicProvider:
-    # 直接抛出 Provider 异常以验证运行上下文会记录失败原因。
-    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
-        raise RuntimeError("Provider request failed")
-
-
-class RecoveringAnthropicProvider:
-    # 初始化调用计数并保留第二轮收到的工具观察结果。
-    def __init__(self) -> None:
-        self._calls = 0
-        self.messages_after_failure: list[dict] = []
-
-    # 先请求不存在的文件，再根据失败观察返回最终答案。
-    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
-        self._calls += 1
-        if self._calls == 1:
-            return LlmResponse(
-                text="I will inspect the old event model path.",
-                tool_calls=[
-                    ToolCall(
-                        id="missing-read-1",
-                        name="read_file",
-                        arguments={"path": "src/manius_code/core/events/models.py"},
-                    )
-                ],
-                assistant_content=[
-                    {
-                        "type": "tool_use",
-                        "id": "missing-read-1",
-                        "name": "read_file",
-                        "input": {"path": "src/manius_code/core/events/models.py"},
-                    }
-                ],
-            )
-        self.messages_after_failure = messages
-        return LlmResponse(
-            text="The event models are available at their current location.",
-            tool_calls=[],
-            assistant_content=[
-                {"type": "text", "text": "The event models are available at their current location."}
+class ReadmeProvider:
+    # 提供只包含一个可验证读取步骤的稳定计划。
+    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="readme",
+                    title="Read README",
+                    allowed_tools=["read_file"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="Main sections")],
+                )
             ],
         )
 
+    # 为读取步骤返回唯一受审计的相对路径动作。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        return ActionProposal(step_id=plan_step.id, tool_name="read_file", arguments={"path": "README.md"})
 
-class FileDeliveryProvider:
-    # 初始化调用计数并保存模型收到的文件交付反馈。
+    # 此稳定计划不应触发修复决策。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        raise AssertionError("README plan should not need repair")
+
+    # 为全部验证完成的读取任务返回最终用户摘要。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "README analysis completed."
+
+
+class RetryingWriteProvider:
+    # 初始化动作计数以让首个真实工具失败后进入重试路径。
     def __init__(self) -> None:
-        self._calls = 0
-        self.feedback_messages: list[dict] = []
+        self._attempts = 0
 
-    # 先模拟空回答，再写入快速排序文件并在下一轮完成任务。
-    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
-        self._calls += 1
-        if self._calls == 1:
-            return LlmResponse(text="", tool_calls=[], assistant_content=[{"type": "text", "text": ""}])
-        if self._calls == 2:
-            self.feedback_messages = messages
-            return _tool_response(
-                "write-quicksort-1",
-                "write_file",
-                {
-                    "path": "tests/learning/quicksort.py",
-                    "content": "def quicksort(values: list[int]) -> list[int]:\n    return sorted(values)\n",
-                },
-            )
-        return LlmResponse(
-            text="Created tests/learning/quicksort.py.",
-            tool_calls=[],
-            assistant_content=[{"type": "text", "text": "Created tests/learning/quicksort.py."}],
+    # 提供一个写入并验证文件内容的交付计划。
+    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="write",
+                    title="Write result",
+                    allowed_tools=["write_file"],
+                    acceptance_criteria=[
+                        AcceptanceCriterion(kind="file_contains", path="result.py", expected="return 1")
+                    ],
+                )
+            ],
         )
 
-
-# 构造包含标准 tool_use 内容块的确定性工具调用响应。
-def _tool_response(call_id: str, name: str, arguments: dict) -> LlmResponse:
-    return LlmResponse(
-        text="Planning the next task.",
-        tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)],
-        assistant_content=[{"type": "tool_use", "id": call_id, "name": name, "input": arguments}],
-    )
-
-
-class AutonomousPlanningProvider:
-    # 初始化确定性规划步骤并保存运行器注入的工具定义名称。
-    def __init__(self) -> None:
-        self._calls = 0
-        self.tool_names: set[str] = set()
-
-    # 记录运行器提供的工具定义后返回同一 Provider 替身。
-    def with_tool_definitions(self, definitions: list[dict]) -> "AutonomousPlanningProvider":
-        self.tool_names = {definition["name"] for definition in definitions}
-        return self
-
-    # 模拟创建依赖任务、执行任务并输出最终交付结果的完整规划流程。
-    async def complete(self, run_id: str, step: int, messages: list[dict]) -> LlmResponse:
-        self._calls += 1
-        calls = [
-            ("create-1", "task_create", {"subject": "Inspect repository"}),
-            ("create-2", "task_create", {"subject": "Write structure report", "blocked_by": [1]}),
-            ("update-1", "task_update", {"task_id": 1, "status": "completed"}),
-            ("update-2", "task_update", {"task_id": 2, "status": "in_progress"}),
-            ("write-1", "write_file", {"path": "structure.md", "content": "# Structure\n"}),
-            ("update-3", "task_update", {"task_id": 2, "status": "completed"}),
-        ]
-        if self._calls <= len(calls):
-            return _tool_response(*calls[self._calls - 1])
-        return LlmResponse(
-            text="Repository structure report completed.",
-            tool_calls=[],
-            assistant_content=[{"type": "text", "text": "Repository structure report completed."}],
+    # 先写向目录触发真实工具错误，再写入通过验收的目标文件。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        self._attempts += 1
+        path = "." if self._attempts == 1 else "result.py"
+        return ActionProposal(
+            step_id=plan_step.id,
+            tool_name="write_file",
+            arguments={"path": path, "content": "def answer() -> int:\n    return 1\n"},
         )
 
+    # 针对首次工具失败要求调度器重试同一已审计步骤。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        return ResolverDecision(action="retry", reason="use the declared output file instead of a directory")
 
-# 功能：验证 AgentRunner 会执行读文件、持久化事件并完成多轮任务。
-# 设计：注入确定性 Claude 替身，覆盖 plan-act-observe 和 events.jsonl，而不依赖外部 API。
-def test_agent_runner_persists_end_to_end_events(tmp_path: Path, monkeypatch) -> None:
-    readme = tmp_path / "README.md"
-    readme.write_text("# Main sections\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    runner = AgentRunner(
-        ManiusConfig(max_steps=2),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: FakeAnthropicProvider(),
-    )
-    summary = asyncio.run(runner.run("Summarize README.md"))
-    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
-    event_types = [json.loads(line)["type"] for line in event_path.read_text(encoding="utf-8").splitlines()]
-    assert summary.status == "success"
-    assert summary.result == "README summary complete."
-    assert summary.reason is None
-    assert summary.total_steps == 2
-    assert "tool_call_start" in event_types
-    assert "tool_call_success" in event_types
-    assert event_types[-1] == "run_finished"
+    # 返回已验证文件交付的简短总结。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "result.py created and verified."
 
 
-# 功能：验证 Provider 异常会写入上下文终态并传播至运行汇总与完成事件。
-# 设计：运行器继续返回失败汇总，方便 CLI 依据 status 统一决定退出状态。
-def test_agent_runner_records_provider_failure_in_summary_and_event(tmp_path: Path) -> None:
-    runner = AgentRunner(
-        ManiusConfig(max_steps=2),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: FailingAnthropicProvider(),
-    )
-    summary = asyncio.run(runner.run("Fail the provider request"))
-    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
-    finished_event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
+class ReplanningProvider:
+    # 初始化标志以便只在第一次失败后提交替换计划。
+    def __init__(self) -> None:
+        self._replanned = False
 
-    assert summary.status == "failed"
-    assert summary.result == ""
-    assert summary.reason == "Provider request failed"
-    assert finished_event["status"] == "failed"
-    assert finished_event["summary"] == "Provider request failed"
-    assert finished_event["reason"] == "Provider request failed"
+    # 先提供会失败的读取计划，借此验证动态重规划闭环。
+    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="missing",
+                    title="Inspect unavailable source",
+                    allowed_tools=["read_file"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="source")],
+                )
+            ],
+        )
 
+    # 根据当前计划步骤选择失败读取或替代计划中的安全写入。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        if plan_step.id == "missing":
+            return ActionProposal(step_id="missing", tool_name="read_file", arguments={"path": "missing.txt"})
+        return ActionProposal(
+            step_id="deliver",
+            tool_name="write_file",
+            arguments={"path": "replanned.txt", "content": "replanned\n"},
+        )
 
-# 功能：验证工具失败会作为观察结果写回上下文，使 Agent 能在下一轮自行纠正并成功完成。
-# 设计：先读取不存在的文件，再断言 Provider 收到失败 tool_result，同时保留工具失败事件用于终端观测。
-def test_agent_runner_recovers_from_tool_failure_by_returning_error_to_provider(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    provider = RecoveringAnthropicProvider()
-    runner = AgentRunner(
-        ManiusConfig(max_steps=2),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: provider,
-    )
+    # 第一次失败提交完整替换计划，以验证计划版本切换后能够继续调度。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        self._replanned = True
+        return ResolverDecision(
+            action="replan",
+            reason="the source does not exist; deliver a verified replacement artifact",
+            plan=PlanProposal(
+                goal=goal,
+                steps=[
+                    PlanStep(
+                        id="deliver",
+                        title="Deliver replacement",
+                        allowed_tools=["write_file"],
+                        acceptance_criteria=[AcceptanceCriterion(kind="file_exists", path="replanned.txt")],
+                    )
+                ],
+            ),
+        )
 
-    summary = asyncio.run(runner.run("Inspect the event model implementation."))
-    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
-    event_types = [json.loads(line)["type"] for line in event_path.read_text(encoding="utf-8").splitlines()]
-    tool_results = [
-        content
-        for message in provider.messages_after_failure
-        if message["role"] == "user" and isinstance(message["content"], list)
-        for content in message["content"]
-        if content["type"] == "tool_result"
-    ]
-
-    assert summary.status == "success"
-    assert summary.result == "The event models are available at their current location."
-    assert "tool_call_failed" in event_types
-    assert len(tool_results) == 1
-    assert tool_results[0]["tool_use_id"] == "missing-read-1"
-    assert tool_results[0]["content"].startswith("Tool 'read_file' failed: file not found:")
-
-
-# 功能：验证文件交付目标在空回答后不会被误判成功，并会驱动模型写入并验证目标文件。
-# 设计：替身先返回无工具响应，再根据运行器反馈调用真实 write_file，以覆盖完成条件与文件存在性校验。
-def test_agent_runner_requires_verified_write_before_completing_file_delivery_goal(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    provider = FileDeliveryProvider()
-    runner = AgentRunner(
-        ManiusConfig(max_steps=3),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: provider,
-    )
-
-    summary = asyncio.run(runner.run("Write a quicksort implementation to tests/learning/quicksort.py."))
-    target = tmp_path / "tests" / "learning" / "quicksort.py"
-
-    assert summary.status == "success"
-    assert target.read_text(encoding="utf-8").startswith("def quicksort")
-    assert any(
-        message["content"].startswith("The goal requires a workspace file")
-        for message in provider.feedback_messages
-        if message["role"] == "user" and isinstance(message["content"], str)
-    )
+    # 返回替换计划产生的验证结果。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "Replacement artifact delivered."
 
 
-# 功能：验证达到最大步数会将统一上下文状态标记为失败并输出失败原因。
-# 设计：复用含工具调用的替身，确保在已有执行步骤后触发步数限制。
-def test_agent_runner_records_max_steps_failure_in_summary_and_event(tmp_path: Path, monkeypatch) -> None:
+class InvalidPlanProvider:
+    # 生成含循环依赖的非法 DAG 以验证审计层不会让它进入执行层。
+    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+        criterion = AcceptanceCriterion(kind="tool_result_contains", expected="unused")
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(id="first", title="First", dependencies=["second"], allowed_tools=["read_file"], acceptance_criteria=[criterion]),
+                PlanStep(id="second", title="Second", dependencies=["first"], allowed_tools=["read_file"], acceptance_criteria=[criterion]),
+            ],
+        )
+
+    # 非法计划必须在动作规划前被审计层拒绝。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        raise AssertionError("invalid plan must not reach the Executor")
+
+    # 非法计划必须在修复器介入前被审计层拒绝。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        raise AssertionError("invalid plan must not reach the Resolver")
+
+    # 非法计划不可能被汇总为成功结果。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        raise AssertionError("invalid plan must not be summarized")
+
+
+# 功能：验证运行器以五层闭环执行受审计计划、持久化计划状态和验证事件，而非旧的直接工具调用循环。
+# 设计：注入结构化替身并读取真实 events.jsonl，覆盖规划、执行、验收、记忆和外部可观测性的完整边界。
+def test_agent_runner_executes_verified_plan_and_persists_memory(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     runner = AgentRunner(
-        ManiusConfig(max_steps=1),
+        ManiusConfig(max_steps=3),
         runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: FakeAnthropicProvider(),
-    )
-    summary = asyncio.run(runner.run("Summarize README.md"))
-    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
-    finished_event = json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])
-
-    assert summary.status == "failed"
-    assert summary.result == ""
-    assert summary.reason == "Agent exceeded max_steps=1"
-    assert finished_event["status"] == "failed"
-    assert finished_event["reason"] == "Agent exceeded max_steps=1"
-
-
-# 功能：验证 daemon 运行器不会本地打印事件，但仍会完成任务并持久化事件。
-# 设计：注入会失败的确定性 Provider，使测试仅关注服务端无终端输出的职责边界。
-def test_agent_runner_does_not_print_local_events(tmp_path: Path, capsys) -> None:
-    runner = AgentRunner(
-        ManiusConfig(max_steps=1),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, _tools: FailingAnthropicProvider(),
-    )
-    summary = asyncio.run(runner.run("Fail without daemon output"))
-    event_path = tmp_path / "runs" / summary.run_id / "events.jsonl"
-
-    assert summary.status == "failed"
-    assert capsys.readouterr().out == ""
-    assert json.loads(event_path.read_text(encoding="utf-8").splitlines()[-1])["type"] == "run_finished"
-
-
-# 功能：验证运行器为每次任务注册八个工具，并由 Agent 自主完成带依赖的任务规划和交付。
-# 设计：以确定性 Provider 串联创建、解锁、执行与完成操作，直接断言 run 私有 .tasks 文件和最终产物。
-def test_agent_runner_executes_autonomous_task_plan_in_isolated_run_directory(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    provider = AutonomousPlanningProvider()
-    runner = AgentRunner(
-        ManiusConfig(max_steps=7),
-        runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus, definitions: provider.with_tool_definitions(definitions),
+        provider_factory=lambda _bus: ReadmeProvider(),
     )
 
-    summary = asyncio.run(runner.run("Analyze the repository and generate a structure report."))
-    tasks_dir = tmp_path / "runs" / summary.run_id / ".tasks"
-    second_task = json.loads((tasks_dir / "task_2.json").read_text(encoding="utf-8"))
+    summary = asyncio.run(runner.run("Analyze README.md"))
+    run_dir = tmp_path / "runs" / summary.run_id
+    event_types = [json.loads(line)["type"] for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    memory = json.loads((tmp_path / ".manius" / "memory" / "episodes.jsonl").read_text(encoding="utf-8"))
 
-    assert provider.tool_names == {
-        "task_create",
-        "task_update",
-        "task_list",
-        "task_get",
-        "read_file",
-        "write_file",
-        "list_dir",
-        "bash",
-    }
     assert summary.status == "success"
-    assert (tmp_path / "structure.md").read_text(encoding="utf-8") == "# Structure\n"
-    assert second_task["status"] == "completed"
-    assert second_task["blocked_by"] == []
+    assert summary.result == "README analysis completed."
+    assert (run_dir / "plan" / "plan.v1.json").is_file()
+    assert json.loads((run_dir / "plan" / "state.json").read_text(encoding="utf-8"))["steps"][0]["status"] == "succeeded"
+    assert not (run_dir / ".tasks").exists()
+    assert (tmp_path / ".manius" / "memory" / "episodes.jsonl").is_file()
+    assert memory["tool_preferences"] == ["read_file"]
+    assert memory["verified_steps"][0]["id"] == "readme"
+    assert {"plan_proposed", "plan_approved", "step_verified", "tool_call_success"}.issubset(event_types)
+    assert event_types[-1] == "run_finished"
+
+
+# 功能：验证真实工具错误不会结束任务，而是经 Resolver 返回调度器并在下一次尝试后完成验收。
+# 设计：首次选择目录触发 WriteFileTool 错误，断言事件和 attempts 记录均保留失败事实，避免仅依赖替身行为。
+def test_agent_runner_recovers_from_tool_failure_with_a_verified_retry(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: RetryingWriteProvider(),
+    )
+
+    summary = asyncio.run(runner.run("Write result.py"))
+    run_dir = tmp_path / "runs" / summary.run_id
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    attempts = [json.loads(line) for line in (run_dir / "plan" / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary.status == "success"
+    assert summary.total_steps == 2
+    assert (tmp_path / "result.py").read_text(encoding="utf-8").endswith("return 1\n")
+    assert any(event["type"] == "tool_call_failed" for event in events)
+    assert attempts[0]["error"] is not None
+    assert attempts[-1]["error"] is None
+
+
+# 功能：验证 Resolver 的 replan 决策会替换活动计划并继续由调度器执行新版本，而不是中止任务。
+# 设计：先执行必然失败的读取动作，再检查两份计划版本、修订事件和最终产物，覆盖版本切换的状态闭环。
+def test_agent_runner_replaces_plan_after_resolver_replan(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    provider = ReplanningProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=4),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: provider,
+    )
+
+    summary = asyncio.run(runner.run("Create a replacement artifact"))
+    plan_dir = tmp_path / "runs" / summary.run_id / "plan"
+    event_types = [json.loads(line)["type"] for line in (tmp_path / "runs" / summary.run_id / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary.status == "success"
+    assert provider._replanned is True
+    assert (tmp_path / "replanned.txt").read_text(encoding="utf-8") == "replanned\n"
+    assert (plan_dir / "plan.v1.json").is_file()
+    assert (plan_dir / "plan.v2.json").is_file()
+    assert "plan_revised" in event_types
+
+
+# 功能：验证 Auditor 会拒绝循环依赖计划，且不会注册或调用旧 TaskManager 与直接工具调用路径。
+# 设计：以循环 DAG 替身验证失败汇总和零执行步，确保非法规划在进入 Executor 前被机器规则阻断。
+def test_agent_runner_rejects_invalid_plan_before_execution(tmp_path: Path) -> None:
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: InvalidPlanProvider(),
+    )
+
+    summary = asyncio.run(runner.run("Invalid plan"))
+    run_dir = tmp_path / "runs" / summary.run_id
+    event_types = [json.loads(line)["type"] for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary.status == "failed"
+    assert summary.total_steps == 0
+    assert "acyclic" in (summary.reason or "")
+    assert not (run_dir / ".tasks").exists()
+    assert event_types == ["run_started", "plan_proposed", "run_finished"]
+
+
+# 功能：验证守护进程运行器只持久化和广播事件，不向本地标准输出泄漏规划或工具日志。
+# 设计：使用成功替身并捕获 stdout，保证新增五层事件不会破坏 daemon 与 CLI/TUI 的职责隔离。
+def test_agent_runner_does_not_print_local_events(tmp_path: Path, monkeypatch, capsys) -> None:
+    (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: ReadmeProvider(),
+    )
+
+    summary = asyncio.run(runner.run("Read README"))
+
+    assert summary.status == "success"
+    assert capsys.readouterr().out == ""

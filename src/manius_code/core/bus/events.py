@@ -44,6 +44,31 @@ class StepDoneEvent(BaseEvent):
     observation: str = ""
 
 
+class PlanProposedEvent(BaseEvent):
+    type: Literal["plan_proposed"] = "plan_proposed"
+    version: int
+    plan: dict[str, Any]
+
+
+class PlanApprovedEvent(BaseEvent):
+    type: Literal["plan_approved"] = "plan_approved"
+    version: int
+    plan_id: str
+
+
+class PlanRevisedEvent(BaseEvent):
+    type: Literal["plan_revised"] = "plan_revised"
+    previous_version: int
+    version: int
+    reason: str
+
+
+class StepVerifiedEvent(BaseEvent):
+    type: Literal["step_verified"] = "step_verified"
+    step_id: str
+    evidence: list[str]
+
+
 class ToolCallStartEvent(BaseEvent):
     type: Literal["tool_call_start"] = "tool_call_start"
     tool_name: str
@@ -86,6 +111,10 @@ AgentEvent = Annotated[
     | RunFinishedEvent
     | StepPlanningEvent
     | StepDoneEvent
+    | PlanProposedEvent
+    | PlanApprovedEvent
+    | PlanRevisedEvent
+    | StepVerifiedEvent
     | ToolCallStartEvent
     | ToolCallSuccessEvent
     | ToolCallFailedEvent
@@ -107,6 +136,10 @@ Event = Annotated[
     | RunFinishedEvent
     | StepPlanningEvent
     | StepDoneEvent
+    | PlanProposedEvent
+    | PlanApprovedEvent
+    | PlanRevisedEvent
+    | StepVerifiedEvent
     | ToolCallStartEvent
     | ToolCallSuccessEvent
     | ToolCallFailedEvent

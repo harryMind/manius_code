@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep
+
+
+class AuditError(ValueError):
+    pass
+
+
+class Auditor:
+    # 注入新执行器允许使用的工具名称集合。
+    def __init__(self, allowed_tools: set[str]) -> None:
+        self._allowed_tools = allowed_tools
+
+    # 校验计划 DAG、工具声明和验收条件是否满足机器规则。
+    def approve_plan(self, proposal: PlanProposal) -> None:
+        identifiers = [step.id for step in proposal.steps]
+        if len(identifiers) != len(set(identifiers)):
+            raise AuditError("plan step IDs must be unique")
+        known_steps = set(identifiers)
+        for step in proposal.steps:
+            if step.id in step.dependencies:
+                raise AuditError(f"step {step.id} cannot depend on itself")
+            unknown_dependencies = set(step.dependencies) - known_steps
+            if unknown_dependencies:
+                raise AuditError(f"step {step.id} has unknown dependencies: {sorted(unknown_dependencies)}")
+            unknown_tools = set(step.allowed_tools) - self._allowed_tools
+            if unknown_tools:
+                raise AuditError(f"step {step.id} uses unavailable tools: {sorted(unknown_tools)}")
+            if not step.acceptance_criteria:
+                raise AuditError(f"step {step.id} must declare acceptance criteria")
+            for criterion in step.acceptance_criteria:
+                if criterion.path is not None and (
+                    Path(criterion.path).is_absolute() or ".." in Path(criterion.path).parts
+                ):
+                    raise AuditError(f"step {step.id} has an unsafe acceptance path")
+        self._assert_acyclic(proposal.steps)
+
+    # 校验动作只会作用于当前步骤允许的工具和工作区路径。
+    def approve_action(self, step: PlanStep, proposal: ActionProposal) -> None:
+        if proposal.step_id != step.id:
+            raise AuditError("action step does not match the scheduled step")
+        if proposal.tool_name not in step.allowed_tools:
+            raise AuditError(f"tool {proposal.tool_name} is not allowed for step {step.id}")
+        path = proposal.arguments.get("path")
+        if isinstance(path, str) and (Path(path).is_absolute() or ".." in Path(path).parts):
+            raise AuditError("action path must stay within the workspace")
+
+    # 通过深度优先遍历拒绝任意环状依赖。
+    def _assert_acyclic(self, steps: list[PlanStep]) -> None:
+        dependencies = {step.id: step.dependencies for step in steps}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        # 深度遍历单个步骤依赖以检测回边。
+        def visit(step_id: str) -> None:
+            if step_id in visiting:
+                raise AuditError("plan dependencies must be acyclic")
+            if step_id in visited:
+                return
+            visiting.add(step_id)
+            for dependency in dependencies[step_id]:
+                visit(dependency)
+            visiting.remove(step_id)
+            visited.add(step_id)
+
+        for step_id in dependencies:
+            visit(step_id)
