@@ -16,8 +16,20 @@ from manius_code.core.events.bus import EventBus
 
 
 class ReadmeProvider:
+    # 保存 Supervisor 注入的动态工具白名单以便断言 Planner 不依赖旧注册表。
+    def __init__(self) -> None:
+        self.available_tools: list[str] = []
+
     # 提供只包含一个可验证读取步骤的稳定计划。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
+        self.available_tools = available_tools
         return PlanProposal(
             goal=goal,
             steps=[
@@ -57,7 +69,14 @@ class RetryingWriteProvider:
         self._attempts = 0
 
     # 提供一个写入并验证文件内容的交付计划。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
         return PlanProposal(
             goal=goal,
             steps=[
@@ -105,7 +124,14 @@ class ReplanningProvider:
         self._replanned = False
 
     # 先提供会失败的读取计划，借此验证动态重规划闭环。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
         return PlanProposal(
             goal=goal,
             steps=[
@@ -162,7 +188,14 @@ class ReplanningProvider:
 
 class InvalidPlanProvider:
     # 生成含循环依赖的非法 DAG 以验证审计层不会让它进入执行层。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
         criterion = AcceptanceCriterion(kind="tool_result_contains", expected="unused")
         return PlanProposal(
             goal=goal,
@@ -198,10 +231,11 @@ class InvalidPlanProvider:
 def test_agent_runner_executes_verified_plan_and_persists_memory(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
+    provider = ReadmeProvider()
     runner = AgentRunner(
         ManiusConfig(max_steps=3),
         runs_dir=tmp_path / "runs",
-        provider_factory=lambda _bus: ReadmeProvider(),
+        provider_factory=lambda _bus: provider,
     )
 
     summary = asyncio.run(runner.run("Analyze README.md"))
@@ -217,6 +251,7 @@ def test_agent_runner_executes_verified_plan_and_persists_memory(tmp_path: Path,
     assert (tmp_path / ".manius" / "memory" / "episodes.jsonl").is_file()
     assert memory["tool_preferences"] == ["read_file"]
     assert memory["verified_steps"][0]["id"] == "readme"
+    assert provider.available_tools == ["bash", "list_dir", "read_file", "write_file"]
     assert {"plan_proposed", "plan_approved", "step_verified", "tool_call_success"}.issubset(event_types)
     assert event_types[-1] == "run_finished"
 

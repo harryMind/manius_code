@@ -13,7 +13,14 @@ _Model = TypeVar("_Model", bound=BaseModel)
 
 class AutonomyProvider(Protocol):
     # 为目标和记忆提出一份可审计的结构化计划。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal: ...
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal: ...
 
     # 为已经调度的计划步骤提出一个受限工具动作。
     async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal: ...
@@ -39,14 +46,28 @@ class StructuredAutonomyProvider:
         self._provider = provider
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
-    async def plan(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
         return await self._request(
             run_id,
             step,
             "You are the Planner in a deterministic agent runtime. Return JSON only, with no markdown and no tool calls. "
-            "Create the smallest dependency DAG that can achieve the goal. Each step must declare allowed_tools and at "
-            "least one verifiable acceptance_criteria using file_exists, file_contains, or tool_result_contains.",
-            {"goal": goal, "verified_memories": memories, "schema": PlanProposal.model_json_schema()},
+            "Create the smallest dependency DAG that can achieve the goal. The available_tools field is the complete tool "
+            "allowlist: use only its exact values and never invent aliases such as filesystem_read or filesystem_write. Each "
+            "step must declare allowed_tools and at least one verifiable acceptance_criteria using file_exists, file_contains, "
+            "or tool_result_contains.",
+            {
+                "goal": goal,
+                "verified_memories": memories,
+                "available_tools": available_tools,
+                "schema": PlanProposal.model_json_schema(),
+            },
             PlanProposal,
         )
 
@@ -149,8 +170,15 @@ class Planner:
         self._provider = provider
 
     # 委托模型提出首个可进入审计流程的计划。
-    async def create(self, run_id: str, step: int, goal: str, memories: list[str]) -> PlanProposal:
-        return await self._provider.plan(run_id, step, goal, memories)
+    async def create(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
+        return await self._provider.plan(run_id, step, goal, memories, available_tools)
 
     # 委托模型针对一个已就绪步骤提出受限动作。
     async def propose_action(

@@ -56,6 +56,7 @@ class AutonomousSupervisor:
             self._context.step,
             self._context.goal,
             self._memory.retrieve(),
+            sorted(self._executor.tool_names()),
         )
         plan = await self._approve_plan(proposal, 1)
         while self._context.step < self._policy.max_steps:
