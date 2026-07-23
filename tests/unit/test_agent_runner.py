@@ -2,7 +2,10 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from manius_code.core.agent.runner import AgentRunner
+from manius_code.core.autonomy.auditor import Auditor
 from manius_code.core.autonomy.contracts import (
     AcceptanceCriterion,
     ActionProposal,
@@ -275,6 +278,20 @@ class InvalidPlanProvider:
         raise AssertionError("invalid plan must not be summarized")
 
 
+class EscapedGoalProvider(ReadmeProvider):
+    # 模拟模型省略礼貌前缀并将 Windows 路径反斜杠重复转义的计划回显。
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+    ) -> PlanProposal:
+        proposal = await super().plan(run_id, step, goal, memories, available_tools)
+        return proposal.model_copy(update={"goal": goal.removeprefix("请").replace("\\", "\\\\")})
+
+
 # 功能：验证运行器以五层闭环执行受审计计划、持久化计划状态和验证事件，而非旧的直接工具调用循环。
 # 设计：注入结构化替身并读取真实 events.jsonl，覆盖规划、执行、验收、记忆和外部可观测性的完整边界。
 def test_agent_runner_executes_verified_plan_and_persists_memory(tmp_path: Path, monkeypatch) -> None:
@@ -303,6 +320,55 @@ def test_agent_runner_executes_verified_plan_and_persists_memory(tmp_path: Path,
     assert provider.available_tools == ["bash", "list_dir", "read_file", "write_file"]
     assert {"plan_proposed", "plan_approved", "step_verified", "tool_call_success"}.issubset(event_types)
     assert event_types[-1] == "run_finished"
+
+
+# 功能：验证模型回显目标时改变 Windows 路径转义或礼貌前缀不会使有效计划在第零步失败。
+# 设计：使用只改写 PlanProposal.goal 的替身保留真实读取、验收与持久化流程，断言持久化计划仍采用外部请求的原始目标。
+def test_agent_runner_uses_requested_goal_when_model_echo_is_escaped(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    goal = r"请在D:\workspace\code\test中分析README.md"
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: EscapedGoalProvider(),
+    )
+
+    summary = asyncio.run(runner.run(goal))
+    persisted = json.loads((tmp_path / "runs" / summary.run_id / "plan" / "plan.v1.json").read_text(encoding="utf-8"))
+
+    assert summary.status == "success"
+    assert persisted["goal"] == goal
+
+
+# 功能：验证审计器允许配置工作区内的绝对路径，同时继续拒绝工作区外路径。
+# 设计：直接构造同一计划的验收路径与动作路径，避免依赖模型输出格式并分别覆盖允许和拒绝边界。
+def test_auditor_allows_absolute_paths_only_inside_configured_workspace(tmp_path: Path) -> None:
+    inside = tmp_path / "result.py"
+    proposal = PlanProposal(
+        goal="Write result",
+        steps=[
+            PlanStep(
+                id="write",
+                title="Write result",
+                allowed_tools=["write_file"],
+                acceptance_criteria=[AcceptanceCriterion(kind="file_exists", path=str(inside))],
+                artifacts=[str(inside)],
+            )
+        ],
+    )
+    auditor = Auditor({"write_file"}, tmp_path)
+
+    auditor.approve_plan(proposal)
+    auditor.approve_action(
+        proposal.steps[0],
+        ActionProposal(step_id="write", tool_name="write_file", arguments={"path": str(inside), "content": "ok"}),
+    )
+    outside = tmp_path.parent / "outside.py"
+    proposal.steps[0].acceptance_criteria[0].path = str(outside)
+    proposal.steps[0].artifacts = [str(outside)]
+    with pytest.raises(ValueError, match="unsafe acceptance path"):
+        auditor.approve_plan(proposal)
 
 
 # 功能：验证真实工具错误不会结束任务，而是经 Resolver 返回调度器并在下一次尝试后完成验收。

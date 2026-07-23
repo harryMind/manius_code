@@ -45,7 +45,7 @@ class AutonomousSupervisor:
         self._planner = Planner(provider)
         self._resolver = Resolver(provider)
         self._executor = Executor(context.run_id, event_bus, tools)
-        self._auditor = Auditor(self._executor.tool_names())
+        self._auditor = Auditor(self._executor.tool_names(), workspace)
         self._scheduler = Scheduler()
         self._verifier = Verifier(workspace)
         self._plans = PlanStore(run_dir)
@@ -97,6 +97,7 @@ class AutonomousSupervisor:
 
     # 将经审计的计划提案版本化并持久化为当前运行的唯一计划事实。
     async def _approve_plan(self, proposal: PlanProposal, version: int) -> Plan:
+        proposal = proposal.model_copy(update={"goal": self._context.goal})
         await self._event_bus.publish(
             PlanProposedEvent(
                 run_id=self._context.run_id,
@@ -105,8 +106,6 @@ class AutonomousSupervisor:
                 plan=proposal.model_dump(mode="json"),
             )
         )
-        if proposal.goal != self._context.goal:
-            raise AuditError("plan goal must match the active run goal")
         self._auditor.approve_plan(proposal)
         plan = Plan(version=version, goal=proposal.goal, steps=proposal.steps)
         self._plans.persist(plan)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep
+from manius_code.core.tools.paths import resolve_workspace_path
 
 
 class AuditError(ValueError):
@@ -10,9 +11,10 @@ class AuditError(ValueError):
 
 
 class Auditor:
-    # 注入新执行器允许使用的工具名称集合。
-    def __init__(self, allowed_tools: set[str]) -> None:
+    # 注入允许工具和受限工作区以统一审计计划与动作路径。
+    def __init__(self, allowed_tools: set[str], workspace: Path) -> None:
         self._allowed_tools = allowed_tools
+        self._workspace = workspace.expanduser().resolve()
 
     # 校验计划 DAG、工具声明和验收条件是否满足机器规则。
     def approve_plan(self, proposal: PlanProposal) -> None:
@@ -41,10 +43,11 @@ class Auditor:
             if step.artifacts and criterion_paths and step.artifacts[0] not in criterion_paths:
                 raise AuditError(f"step {step.id} artifact must match its acceptance path")
             for criterion in step.acceptance_criteria:
-                if criterion.path is not None and (
-                    Path(criterion.path).is_absolute() or ".." in Path(criterion.path).parts
-                ):
-                    raise AuditError(f"step {step.id} has an unsafe acceptance path")
+                if criterion.path is not None:
+                    try:
+                        resolve_workspace_path(criterion.path, self._workspace)
+                    except ValueError as error:
+                        raise AuditError(f"step {step.id} has an unsafe acceptance path") from error
         self._assert_acyclic(proposal.steps)
 
     # 校验动作只会作用于当前步骤允许的工具和工作区路径。
@@ -54,8 +57,11 @@ class Auditor:
         if proposal.tool_name not in step.allowed_tools:
             raise AuditError(f"tool {proposal.tool_name} is not allowed for step {step.id}")
         path = proposal.arguments.get("path")
-        if isinstance(path, str) and (Path(path).is_absolute() or ".." in Path(path).parts):
-            raise AuditError("action path must stay within the workspace")
+        if isinstance(path, str):
+            try:
+                resolve_workspace_path(path, self._workspace)
+            except ValueError as error:
+                raise AuditError("action path must stay within the workspace") from error
 
     # 通过深度优先遍历拒绝任意环状依赖。
     def _assert_acyclic(self, steps: list[PlanStep]) -> None:
