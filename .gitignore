@@ -5,3 +5,4 @@ runs/
 uv.lock
 .venv/
 .pytest_cache/
+.manius
