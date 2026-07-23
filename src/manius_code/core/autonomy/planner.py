@@ -10,9 +10,9 @@ from manius_code.core.llm.anthropic import AnthropicProvider, LlmResponse
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
-
+# 定义智能体自主运行必须具备四大能力 也就是规划器的核心操作
 class AutonomyProvider(Protocol):
-    # 为目标和记忆提出一份可审计的结构化计划。
+    # 为目标和记忆提出一份可审计的结构化计划。 拆分多个PlanStep，约束是依据提示词写死的
     async def plan(
         self,
         run_id: str,
@@ -22,7 +22,8 @@ class AutonomyProvider(Protocol):
         available_tools: list[str],
     ) -> PlanProposal: ...
 
-    # 为已经调度的计划步骤提出一个受限工具动作。
+    # 为已经调度的计划步骤提出一个受限工具动作。plan() → PlanProposal[PlanStepA, PlanStepB]
+    # 选择一个PlanStepA调用其action
     async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal: ...
 
     # 根据失败事实提出重试、修订、重规划或中止决策。
@@ -169,7 +170,7 @@ class StructuredAutonomyProvider:
 class Planner:
     # 注入满足规划契约的模型适配器以隔离计划生成职责。
     def __init__(self, provider: AutonomyProvider) -> None:
-        self._provider = provider
+        self._provider = provider # 这里传入的应该是上面创建的 StructuredAutonomyProvider
 
     # 委托模型提出首个可进入审计流程的计划。
     async def create(
