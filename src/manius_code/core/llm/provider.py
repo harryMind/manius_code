@@ -17,7 +17,7 @@ class LlmProvider(Protocol):
         emit_tokens: bool = True,
     ) -> LlmResponse: ...
 
-    # 以 Pydantic 模型作为原生响应格式请求并返回已校验的结构化结果。
+    # 由各厂商 Provider 映射原生参数并校验响应后返回与业务模型一致的结构化结果。
     async def complete_structured(
         self,
         run_id: str,

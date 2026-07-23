@@ -82,7 +82,7 @@ class StructuredAutonomyProvider:
             },
             action_response_model(plan_step.id, plan_step.allowed_tools, self._tool_argument_models),
         )
-        return ActionProposal.model_validate(response.action.model_dump(mode="json"))
+        return ActionProposal.model_construct(**response.action.model_dump(mode="json"))
 
     # 请求模型在失败后返回受限的 ResolverDecision。
     async def resolve(

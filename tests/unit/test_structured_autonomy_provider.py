@@ -81,7 +81,7 @@ def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> N
 
 
 # 功能：验证动作规划会按当前步骤白名单生成包含具体工具参数模型的原生响应 schema。
-# 设计：只允许 read_file 并检查动态响应模型与最终 ActionProposal，防止无界 dict 在 API schema 中退化为空对象。
+# 设计：只允许 read_file 并检查动态响应模型与最终 ActionProposal，确保业务层只投影 Provider 已校验的结果而不重复校验原始载荷。
 def test_structured_autonomy_provider_uses_tool_specific_action_schema() -> None:
     llm = FakeLlmProvider(
         json.dumps(

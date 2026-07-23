@@ -13,6 +13,11 @@ from manius_code.core.tracing import TracingProvider
 
 _StructuredModel = TypeVar("_StructuredModel", bound=BaseModel)
 
+
+class AnthropicStructuredOutputError(RuntimeError):
+    pass
+
+
 class AnthropicProvider:
     # 注入 Claude 配置、事件总线和可选的异步 SDK 客户端。
     def __init__(
@@ -155,18 +160,8 @@ class AnthropicProvider:
                 messages=messages,
                 output_format=response_model,
             )
-            parsed_output = response.parsed_output
-            if not isinstance(parsed_output, response_model):
-                response, parsed_output = await self._complete_with_schema_tool(
-                    client,
-                    messages,
-                    response_model,
-                    system_instruction or legacy_agent_instruction(),
-                    run_id,
-                    step,
-                    trace_id,
-                )
-        except ValidationError:
+            parsed_output = self._validate_structured_output(response_model, response.parsed_output)
+        except (ValidationError, AnthropicStructuredOutputError):
             response, parsed_output = await self._complete_with_schema_tool(
                 client,
                 messages,
@@ -260,13 +255,28 @@ class AnthropicProvider:
                 if block.type != "tool_use" or block.name != tool_name:
                     continue
                 try:
-                    return response, response_model.model_validate(block.input)
-                except ValidationError as error:
+                    return response, self._validate_structured_output(response_model, block.input)
+                except AnthropicStructuredOutputError as error:
                     last_error = str(error)
                     break
             else:
                 last_error = "required schema tool was not called"
         raise RuntimeError(f"LLM returned invalid {response_model.__name__} schema-tool arguments: {last_error}")
+
+    # 在 Anthropic Provider 内统一执行响应模型校验，避免业务层了解厂商返回的原始载荷。
+    def _validate_structured_output(
+        self,
+        response_model: type[_StructuredModel],
+        payload: Any,
+    ) -> _StructuredModel:
+        if isinstance(payload, response_model):
+            return payload
+        try:
+            return response_model.model_validate(payload)
+        except ValidationError as error:
+            raise AnthropicStructuredOutputError(
+                f"invalid {response_model.__name__} structured output: {error}"
+            ) from error
 
     # 根据配置惰性创建 Anthropic 异步客户端。
     def _create_client(self) -> Any:
