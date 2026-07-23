@@ -10,6 +10,7 @@ from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import AgentEvent, LlmTokenEvent
 from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.prompt import legacy_agent_instruction
 
 
 class FakeBlock(BaseModel):
@@ -87,6 +88,7 @@ def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
     )
     response = asyncio.run(provider.complete("run-1", 1, [{"role": "user", "content": "Read README.md"}]))
     assert client.messages.request["model"] == "test-model"
+    assert client.messages.request["system"] == legacy_agent_instruction()
     assert response.tool_calls[0].name == "read_file"
     assert events[0].type == "llm_request"
     assert [event.token for event in events if event.type == "llm_token"] == ["I will ", "read the file."]

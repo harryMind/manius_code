@@ -8,6 +8,7 @@ from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
 from manius_code.core.llm.models import LlmResponse, ToolCall
+from manius_code.core.prompt import legacy_agent_instruction
 from manius_code.core.tracing import TracingProvider
 
 class AnthropicProvider:
@@ -43,13 +44,7 @@ class AnthropicProvider:
         request_payload = {
             "model": self._config.default_model,
             "max_tokens": 4096,
-            "system": system_instruction or (
-                "You are a helpful AI assistant. Use the available tools to complete the user's goal. "
-                "For multi-step work, first create a concise task plan with task_create, express task "
-                "dependencies with integer IDs, and use task_list to decide what is unblocked. Update a "
-                "task to in_progress before executing it and to completed only after it is done. "
-                "When the goal is fully achieved, respond with a final answer and do not call any more tools."
-            ),
+            "system": system_instruction or legacy_agent_instruction(),
             "messages": messages,
             "tools": self._tool_definitions,
             "cache_control": {"type": "ephemeral"},

@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
 from manius_code.core.llm.models import LlmResponse
 from manius_code.core.llm.provider import LlmProvider
+from manius_code.core.prompt import action_instruction, plan_instruction, resolver_instruction, summary_instruction
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -59,11 +60,7 @@ class StructuredAutonomyProvider:
         return await self._request(
             run_id,
             step,
-            "You are the Planner in a deterministic agent runtime. Return JSON only, with no markdown and no tool calls. "
-            "Create the smallest dependency DAG that can achieve the goal. The available_tools field is the complete tool "
-            "allowlist: use only its exact values and never invent aliases such as filesystem_read or filesystem_write. Each "
-            "step must declare allowed_tools and at least one verifiable acceptance_criteria using file_exists, file_contains, "
-            "or tool_result_contains.",
+            plan_instruction(),
             {
                 "goal": goal,
                 "verified_memories": memories,
@@ -78,8 +75,7 @@ class StructuredAutonomyProvider:
         return await self._request(
             run_id,
             step,
-            "You are the Executor planner. Return JSON only, with no markdown and no tool calls. Propose exactly one action "
-            "for the supplied step. Its tool_name must be in allowed_tools and all paths must be workspace-relative.",
+            action_instruction(),
             {
                 "plan_step": plan_step.model_dump(mode="json"),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
@@ -101,11 +97,7 @@ class StructuredAutonomyProvider:
         return await self._request(
             run_id,
             step,
-            "You are the Resolver. Return JSON only, with no markdown and no tool calls. Use retry for a transient tool failure, "
-            "revise_step when the current step or its acceptance criteria are wrong, replan when dependencies are invalid, and abort "
-            "only when the goal cannot be safely completed. A revise_step decision must include revised_step with the same id. A replan "
-            "decision must include a complete PlanProposal. When only the acceptance criterion was wrong, revise it to match the existing "
-            "successful tool observation so the runtime can verify it without executing the tool again.",
+            resolver_instruction(),
             {
                 "goal": goal,
                 "plan_step": plan_step.model_dump(mode="json"),
@@ -134,7 +126,7 @@ class StructuredAutonomyProvider:
                     ),
                 }
             ],
-            system_instruction="You summarize a completed agent run. Use only the supplied verified facts and return a concise user-facing result.",
+            system_instruction=summary_instruction(),
             emit_tokens=True,
         )
         return response.text.strip()

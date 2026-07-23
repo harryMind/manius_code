@@ -4,6 +4,7 @@ from typing import Any
 
 from manius_code.core.autonomy.planner import StructuredAutonomyProvider
 from manius_code.core.llm.models import LlmResponse
+from manius_code.core.prompt import plan_instruction
 
 
 class FakeLlmProvider:
@@ -56,4 +57,5 @@ def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> N
     payload = json.loads(request["messages"][0]["content"])
     assert plan.steps[0].allowed_tools == ["read_file"]
     assert payload["available_tools"] == ["read_file"]
+    assert request["system_instruction"] == plan_instruction()
     assert request["emit_tokens"] is False
