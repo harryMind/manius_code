@@ -75,6 +75,7 @@ def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> N
     payload = json.loads(request["messages"][0]["content"])
     assert plan.steps[0].allowed_tools == ["read_file"]
     assert payload["available_tools"] == ["read_file"]
+    assert payload["workspace_root"]
     assert "schema" not in payload
     assert request["system_instruction"] == plan_instruction()
     assert request["response_model"] is PlanProposal
@@ -123,4 +124,6 @@ def test_plan_proposal_schema_requires_non_empty_tools_and_acceptance_criteria()
     step_schema = schema["$defs"]["PlannedStep"]
 
     assert step_schema["properties"]["allowed_tools"]["minItems"] == 1
+    assert step_schema["properties"]["allowed_tools"]["maxItems"] == 1
     assert step_schema["properties"]["acceptance_criteria"]["minItems"] == 1
+    assert step_schema["properties"]["artifacts"]["maxItems"] == 1

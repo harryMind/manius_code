@@ -44,3 +44,11 @@ def test_load_config_maps_tavily_api_key(tmp_path: Path) -> None:
     config = load_config(tmp_path, {"MANIUS_TAVILY_API_KEY": "tvly-test"})
 
     assert config.tavily.api_key == "tvly-test"
+
+
+# 功能：验证可配置工作区会解析为启动目录外的绝对任务根目录。
+# 设计：通过环境变量传入相对路径并断言以 load_config 的 cwd 为基准，避免 daemon 当前目录泄漏到工具边界。
+def test_load_config_resolves_configured_workspace(tmp_path: Path) -> None:
+    config = load_config(tmp_path, {"MANIUS_WORKSPACE": "../agent-output"})
+
+    assert config.workspace == (tmp_path.parent / "agent-output").resolve()

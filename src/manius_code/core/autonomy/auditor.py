@@ -29,8 +29,17 @@ class Auditor:
             unknown_tools = set(step.allowed_tools) - self._allowed_tools
             if unknown_tools:
                 raise AuditError(f"step {step.id} uses unavailable tools: {sorted(unknown_tools)}")
+            if len(step.allowed_tools) != 1:
+                raise AuditError(f"step {step.id} must allow exactly one tool")
+            if len(step.artifacts) > 1:
+                raise AuditError(f"step {step.id} must declare at most one artifact")
             if not step.acceptance_criteria:
                 raise AuditError(f"step {step.id} must declare acceptance criteria")
+            criterion_paths = {criterion.path for criterion in step.acceptance_criteria if criterion.path is not None}
+            if len(criterion_paths) > 1:
+                raise AuditError(f"step {step.id} cannot verify multiple file outputs")
+            if step.artifacts and criterion_paths and step.artifacts[0] not in criterion_paths:
+                raise AuditError(f"step {step.id} artifact must match its acceptance path")
             for criterion in step.acceptance_criteria:
                 if criterion.path is not None and (
                     Path(criterion.path).is_absolute() or ".." in Path(criterion.path).parts

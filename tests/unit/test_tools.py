@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -6,7 +7,7 @@ import pytest
 
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import AgentEvent
-from manius_code.core.tools.bash import BashTool
+from manius_code.core.tools.bash import BashTool, _shell_arguments
 from manius_code.core.tools.file_tools import ListDirTool, WriteFileTool
 from manius_code.core.tools.invocation import ToolExecutionError, ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
@@ -59,3 +60,30 @@ def test_execution_tools_enforce_workspace_boundaries_and_output_limits(tmp_path
     )
     with pytest.raises(ToolExecutionError, match="command exited with code 3"):
         asyncio.run(bash_tool.execute({"command": f'"{sys.executable}" -c "import sys; sys.exit(3)"'}))
+
+
+# 功能：验证文件工具和命令工具使用注入工作区且按宿主系统选择实际 Shell。
+# 设计：让进程当前目录与配置工作区不同，断言产物只能写到后者，并直接检查平台分支避免依赖本机命令别名。
+def test_execution_tools_use_injected_workspace_and_native_shell(tmp_path: Path, monkeypatch) -> None:
+    launcher = tmp_path / "launcher"
+    workspace = tmp_path / "agent-output"
+    launcher.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(launcher)
+    write_tool = WriteFileTool(workspace)
+    bash_tool = BashTool(workspace)
+
+    asyncio.run(write_tool.execute({"path": "nested/result.txt", "content": "complete"}))
+    command = f'"{sys.executable}" -c "from pathlib import Path; Path(\'from_command.txt\').write_text(\'ok\')"'
+    assert asyncio.run(bash_tool.execute({"command": command})).startswith("exit_code=0")
+
+    assert (workspace / "nested" / "result.txt").read_text(encoding="utf-8") == "complete"
+    assert (workspace / "from_command.txt").read_text(encoding="utf-8") == "ok"
+    assert not (launcher / "nested" / "result.txt").exists()
+    shell = _shell_arguments("echo ok")
+    if os.name == "nt":
+        assert shell[:5] == ("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command")
+        assert "PowerShell" in bash_tool.definition["description"]
+    else:
+        assert shell[:2] == ("/bin/sh", "-lc")
+        assert "POSIX shell" in bash_tool.definition["description"]

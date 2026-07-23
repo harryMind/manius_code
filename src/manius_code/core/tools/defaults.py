@@ -12,7 +12,12 @@ TavilyClientFactory = Callable[[str], TavilyClient]
 
 # 按配置组装内置工具与可选 Tavily 插件，作为 Agent 依赖注入的唯一组合根。
 def default_tool_catalog(config: ManiusConfig, tavily_client_factory: TavilyClientFactory = TavilySdkClient) -> ToolCatalog:
-    tools = [ReadFileTool(), WriteFileTool(), ListDirTool(), BashTool()]
+    tools = [
+        ReadFileTool(config.workspace),
+        WriteFileTool(config.workspace),
+        ListDirTool(config.workspace),
+        BashTool(config.workspace),
+    ]
     if config.tavily.api_key:
         client = tavily_client_factory(config.tavily.api_key)
         tools.extend([TavilySearchTool(client), TavilyReadTool(client)])

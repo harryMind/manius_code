@@ -42,6 +42,7 @@ class ManiusConfig(BaseModel):
     # IPC服务基础
     host: str = Field(default="127.0.0.1")
     port: int = Field(default=7437, ge=1, le=65535)
+    workspace: Path = Field(default_factory=Path.cwd)
     
     # 日志配置
     log: LogConfig = Field(default_factory=LogConfig)
@@ -125,6 +126,9 @@ def load_config(cwd: Path | None = None, environ: dict[str, str] | None = None) 
     merged.update(_environment_values(_read_dotenv(working_directory / ".env")))
     merged.update(_environment_values(environment))
     try:
-        return ManiusConfig.model_validate(merged)
+        config = ManiusConfig.model_validate(merged)
     except ValidationError as error:
         raise ConfigError(str(error)) from error
+    workspace = config.workspace.expanduser()
+    config.workspace = workspace.resolve() if workspace.is_absolute() else (working_directory / workspace).resolve()
+    return config

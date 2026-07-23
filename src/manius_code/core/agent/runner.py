@@ -100,7 +100,7 @@ class AgentRunner:
             provider,
             event_bus,
             run_dir,
-            Path.cwd(),
+            self._config.workspace,
             AutonomyPolicy(max_steps=self._config.max_steps),
             tools,
         )
@@ -201,4 +201,5 @@ class AgentRunner:
         return StructuredAutonomyProvider(
             AnthropicProvider(self._config.llm, event_bus, [], tracer=self._tracer),
             tools.argument_models(),
+            workspace=self._config.workspace,
         )

@@ -47,7 +47,7 @@ class AutonomousSupervisor:
         self._executor = Executor(context.run_id, event_bus, tools)
         self._auditor = Auditor(self._executor.tool_names())
         self._scheduler = Scheduler()
-        self._verifier = Verifier()
+        self._verifier = Verifier(workspace)
         self._plans = PlanStore(run_dir)
         self._memory = MemoryStore(run_dir, workspace)
         self._history: list[StepResult] = []

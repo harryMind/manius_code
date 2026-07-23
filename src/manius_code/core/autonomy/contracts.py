@@ -31,8 +31,9 @@ class PlanStep(BaseModel):
 
 
 class PlannedStep(PlanStep):
-    allowed_tools: list[str] = Field(min_length=1)
+    allowed_tools: list[str] = Field(min_length=1, max_length=1)
     acceptance_criteria: list[AcceptanceCriterion] = Field(min_length=1)
+    artifacts: list[str] = Field(default_factory=list, max_length=1)
 
 
 class PlanProposal(BaseModel):

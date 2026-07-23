@@ -18,8 +18,8 @@ class ListDirectoryArguments(BaseModel):
 
 
 # 将已校验的工作区路径转换为稳定的相对显示名称。
-def _workspace_label(path: Path) -> str:
-    return path.relative_to(Path.cwd().resolve()).as_posix() or "."
+def _workspace_label(path: Path, workspace: Path) -> str:
+    return path.relative_to(workspace).as_posix() or "."
 
 
 class WriteFileTool:
@@ -38,11 +38,15 @@ class WriteFileTool:
         },
     }
 
+    # 注入任务工作区以隔离文件写入范围而不改变 daemon 进程的当前目录。
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace = (workspace or Path.cwd()).expanduser().resolve()
+
     # 写入文本文件并保证目标路径始终位于当前工作区内。
     async def execute(self, arguments: dict[str, Any]) -> str:
         try:
             values = WriteFileArguments.model_validate(arguments)
-            path = resolve_workspace_path(values.path)
+            path = resolve_workspace_path(values.path, self._workspace)
         except ValidationError as error:
             raise ToolExecutionError(self.name, "requires valid 'path' and 'content' strings") from error
         except ValueError as error:
@@ -50,7 +54,7 @@ class WriteFileTool:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(values.content, encoding="utf-8")
-            return f"wrote {len(values.content)} characters to {_workspace_label(path)}"
+            return f"wrote {len(values.content)} characters to {_workspace_label(path, self._workspace)}"
         except IsADirectoryError as error:
             raise ToolExecutionError(self.name, f"path is a directory, not a file: {path}") from error
         except PermissionError as error:
@@ -74,11 +78,15 @@ class ListDirTool:
         },
     }
 
+    # 注入任务工作区以隔离目录遍历范围而不改变 daemon 进程的当前目录。
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace = (workspace or Path.cwd()).expanduser().resolve()
+
     # 列出受限深度的目录树，同时避免沿符号链接进入工作区外。
     async def execute(self, arguments: dict[str, Any]) -> str:
         try:
             values = ListDirectoryArguments.model_validate(arguments)
-            path = resolve_workspace_path(values.path)
+            path = resolve_workspace_path(values.path, self._workspace)
         except ValidationError as error:
             raise ToolExecutionError(self.name, "requires a valid 'path' and max_depth between 0 and 8") from error
         except ValueError as error:
@@ -89,7 +97,7 @@ class ListDirTool:
             raise ToolExecutionError(self.name, f"path is not a directory: {path}")
         try:
             entries = self._collect(path, values.max_depth)
-            header = f"{_workspace_label(path)}/"
+            header = f"{_workspace_label(path, self._workspace)}/"
             return "\n".join([header, *entries]) if entries else f"{header}\n(empty)"
         except PermissionError as error:
             raise ToolExecutionError(self.name, f"permission denied: {path}") from error

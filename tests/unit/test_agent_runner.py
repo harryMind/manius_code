@@ -328,6 +328,28 @@ def test_agent_runner_recovers_from_tool_failure_with_a_verified_retry(tmp_path:
     assert attempts[-1]["error"] is None
 
 
+# 功能：验证运行器会将配置工作区同时注入文件工具、验收器和任务记忆。
+# 设计：让 daemon 启动目录与任务根目录分离，并复用真实写入重试 Provider 覆盖执行与验收路径的一致性。
+def test_agent_runner_uses_configured_workspace_for_external_task_output(tmp_path: Path, monkeypatch) -> None:
+    launcher = tmp_path / "daemon"
+    workspace = tmp_path / "student-system"
+    launcher.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(launcher)
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3, workspace=workspace),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: RetryingWriteProvider(),
+    )
+
+    summary = asyncio.run(runner.run("Write result.py in the configured workspace"))
+
+    assert summary.status == "success"
+    assert (workspace / "result.py").read_text(encoding="utf-8").endswith("return 1\n")
+    assert (workspace / ".manius" / "memory" / "episodes.jsonl").is_file()
+    assert not (launcher / "result.py").exists()
+
+
 # 功能：验证 Resolver 的 replan 决策会替换活动计划并继续由调度器执行新版本，而不是中止任务。
 # 设计：先执行必然失败的读取动作，再检查两份计划版本、修订事件和最终产物，覆盖版本切换的状态闭环。
 def test_agent_runner_replaces_plan_after_resolver_replan(tmp_path: Path, monkeypatch) -> None:

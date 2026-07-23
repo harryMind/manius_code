@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Mapping, Protocol, TypeVar
 
 from pydantic import BaseModel
@@ -45,9 +46,15 @@ class AutonomyProvider(Protocol):
 
 class StructuredAutonomyProvider:
     # 注入任意满足通用 LLM 契约的实现，隔离厂商 SDK 与自主规划逻辑。
-    def __init__(self, provider: LlmProvider, tool_argument_models: Mapping[str, type[BaseModel]]) -> None:
+    def __init__(
+        self,
+        provider: LlmProvider,
+        tool_argument_models: Mapping[str, type[BaseModel]],
+        workspace: Path | None = None,
+    ) -> None:
         self._provider = provider
         self._tool_argument_models = tool_argument_models
+        self._workspace = (workspace or Path.cwd()).expanduser().resolve()
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
     async def plan(
@@ -64,6 +71,7 @@ class StructuredAutonomyProvider:
             plan_instruction(),
             {
                 "goal": goal,
+                "workspace_root": str(self._workspace),
                 "verified_memories": memories,
                 "available_tools": available_tools,
             },
@@ -78,6 +86,7 @@ class StructuredAutonomyProvider:
             action_instruction(),
             {
                 "plan_step": plan_step.model_dump(mode="json"),
+                "workspace_root": str(self._workspace),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
             },
             action_response_model(plan_step.id, plan_step.allowed_tools, self._tool_argument_models),
@@ -100,6 +109,7 @@ class StructuredAutonomyProvider:
             resolver_instruction(),
             {
                 "goal": goal,
+                "workspace_root": str(self._workspace),
                 "plan_step": plan_step.model_dump(mode="json"),
                 "failure": result.model_dump(mode="json"),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],

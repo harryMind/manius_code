@@ -1,4 +1,5 @@
 import codecs
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -26,10 +27,14 @@ class ReadFileTool:
         },
     }
 
+    # 注入任务工作区以隔离文件读取范围而不改变 daemon 进程的当前目录。
+    def __init__(self, workspace: Path | None = None) -> None:
+        self._workspace = (workspace or Path.cwd()).expanduser().resolve()
+
     # 读取 UTF-8 文本文件并转换底层异常为工具错误。
     async def execute(self, arguments: dict[str, Any]) -> str:
         try:
-            path = resolve_workspace_path(ReadFileArguments.model_validate(arguments).path)
+            path = resolve_workspace_path(ReadFileArguments.model_validate(arguments).path, self._workspace)
         except ValidationError as error:
             raise ToolExecutionError(self.name, "requires a valid 'path' string") from error
         except ValueError as error:
