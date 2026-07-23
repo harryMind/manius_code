@@ -7,20 +7,8 @@ from pydantic import BaseModel
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
+from manius_code.core.llm.models import LlmResponse, ToolCall
 from manius_code.core.tracing import TracingProvider
-
-
-class ToolCall(BaseModel):
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-class LlmResponse(BaseModel):
-    text: str
-    tool_calls: list[ToolCall]
-    assistant_content: list[dict[str, Any]]
-
 
 class AnthropicProvider:
     # 注入 Claude 配置、事件总线和可选的异步 SDK 客户端。

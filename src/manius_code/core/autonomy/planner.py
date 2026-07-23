@@ -6,7 +6,8 @@ from typing import Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
-from manius_code.core.llm.anthropic import AnthropicProvider, LlmResponse
+from manius_code.core.llm.models import LlmResponse
+from manius_code.core.llm.provider import LlmProvider
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -42,8 +43,8 @@ class AutonomyProvider(Protocol):
 
 
 class StructuredAutonomyProvider:
-    # 注入复用的 Anthropic Provider，所有新运行时请求均禁用旧工具调用协议。
-    def __init__(self, provider: AnthropicProvider) -> None:
+    # 注入任意满足通用 LLM 契约的实现，隔离厂商 SDK 与自主规划逻辑。
+    def __init__(self, provider: LlmProvider) -> None:
         self._provider = provider
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
