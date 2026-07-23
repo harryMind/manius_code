@@ -2,7 +2,7 @@ import time
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
@@ -147,13 +147,35 @@ class AnthropicProvider:
                 step=step,
                 trace_id=trace_id,
             )
-        response = await client.messages.parse(
-            model=self._config.default_model,
-            max_tokens=4096,
-            system=system_instruction or legacy_agent_instruction(),
-            messages=messages,
-            output_format=response_model,
-        )
+        try:
+            response = await client.messages.parse(
+                model=self._config.default_model,
+                max_tokens=4096,
+                system=system_instruction or legacy_agent_instruction(),
+                messages=messages,
+                output_format=response_model,
+            )
+            parsed_output = response.parsed_output
+            if not isinstance(parsed_output, response_model):
+                response, parsed_output = await self._complete_with_schema_tool(
+                    client,
+                    messages,
+                    response_model,
+                    system_instruction or legacy_agent_instruction(),
+                    run_id,
+                    step,
+                    trace_id,
+                )
+        except ValidationError:
+            response, parsed_output = await self._complete_with_schema_tool(
+                client,
+                messages,
+                response_model,
+                system_instruction or legacy_agent_instruction(),
+                run_id,
+                step,
+                trace_id,
+            )
         if self._tracer is not None:
             response_payload = self._response_payload(response)
             self._tracer.emit(
@@ -169,9 +191,6 @@ class AnthropicProvider:
                 step=step,
                 trace_id=trace_id,
             )
-        parsed_output = response.parsed_output
-        if not isinstance(parsed_output, response_model):
-            raise RuntimeError(f"LLM did not return a valid {response_model.__name__} structured output")
         text = "\n".join(block.text for block in response.content if block.type == "text")
         await self._event_bus.publish(
             LlmResponseEvent(
@@ -183,6 +202,52 @@ class AnthropicProvider:
             )
         )
         return parsed_output
+
+    # 在兼容端点忽略 output_config 时，以强制单一工具调用继续取得受 Schema 约束的结果。
+    async def _complete_with_schema_tool(
+        self,
+        client: Any,
+        messages: list[dict[str, Any]],
+        response_model: type[_StructuredModel],
+        system_instruction: str,
+        run_id: str,
+        step: int,
+        trace_id: str,
+    ) -> tuple[Any, _StructuredModel]:
+        tool_name = "emit_structured_result"
+        request_payload = {
+            "model": self._config.default_model,
+            "max_tokens": 4096,
+            "system": system_instruction,
+            "messages": messages,
+            "tools": [
+                {
+                    "name": tool_name,
+                    "description": "Return the requested structured result.",
+                    "input_schema": response_model.model_json_schema(),
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": tool_name},
+        }
+        if self._tracer is not None:
+            self._tracer.emit(
+                "CORE>LLM",
+                "llm",
+                "request",
+                {"request": request_payload, "fallback_for": "output_config", "message_count": len(messages), "tool_count": 1},
+                run_id=run_id,
+                step=step,
+                trace_id=trace_id,
+            )
+        response = await client.messages.create(**request_payload)
+        for block in response.content:
+            if block.type != "tool_use" or block.name != tool_name:
+                continue
+            try:
+                return response, response_model.model_validate(block.input)
+            except ValidationError as error:
+                raise RuntimeError(f"LLM returned invalid {response_model.__name__} schema-tool arguments") from error
+        raise RuntimeError(f"LLM did not call required schema tool for {response_model.__name__}")
 
     # 根据配置惰性创建 Anthropic 异步客户端。
     def _create_client(self) -> Any:

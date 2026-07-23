@@ -59,6 +59,8 @@ class FakeMessages:
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
         self.structured_request: dict[str, Any] | None = None
+        self.schema_tool_request: dict[str, Any] | None = None
+        self.invalid_structured_output = False
 
     # 模拟 Anthropic messages.stream 并保存请求参数。
     def stream(self, **kwargs: Any) -> FakeStream:
@@ -76,6 +78,11 @@ class FakeMessages:
     async def parse(self, **kwargs: Any) -> FakeParsedResponse:
         self.structured_request = kwargs
         response_model = kwargs["output_format"]
+        if self.invalid_structured_output:
+            return FakeParsedResponse(
+                content=[FakeBlock(type="text", text='{"steps":[]}')],
+                parsed_output={"steps": []},
+            )
         return FakeParsedResponse(
             content=[FakeBlock(type="text", text='{"goal":"Structured"}')],
             parsed_output=response_model.model_validate(
@@ -91,6 +98,30 @@ class FakeMessages:
                     ],
                 }
             ),
+        )
+
+    # 模拟兼容端点使用受强制 tool_choice 约束的工具输入返回结构化结果。
+    async def create(self, **kwargs: Any) -> FakeResponse:
+        self.schema_tool_request = kwargs
+        return FakeResponse(
+            content=[
+                FakeBlock(
+                    type="tool_use",
+                    id="structured-tool-1",
+                    name="emit_structured_result",
+                    input={
+                        "goal": "Structured fallback",
+                        "steps": [
+                            {
+                                "id": "inspect",
+                                "title": "Inspect",
+                                "allowed_tools": ["read_file"],
+                                "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "ok"}],
+                            }
+                        ],
+                    },
+                )
+            ]
         )
 
 
@@ -146,6 +177,29 @@ def test_anthropic_provider_uses_native_pydantic_structured_output() -> None:
     assert client.messages.structured_request["output_format"] is PlanProposal
     assert client.messages.structured_request["system"] == "Return a plan"
     assert [event.type for event in events] == ["llm_request", "llm_response"]
+
+
+# 功能：验证兼容端点返回不符合 output_config 的内容时会改用强制 Schema 工具调用恢复规划结果。
+# 设计：让 SDK 替身返回无效 parsed_output，再断言二次请求固定 tool_choice 且结果仍经 PlanProposal 校验，不依赖真实供应商行为。
+def test_anthropic_provider_falls_back_to_forced_schema_tool_for_invalid_native_output() -> None:
+    event_bus = EventBus()
+    client = FakeClient()
+    client.messages.invalid_structured_output = True
+    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
+
+    plan = asyncio.run(
+        provider.complete_structured(
+            "run-structured",
+            2,
+            [{"role": "user", "content": "Create a plan"}],
+            PlanProposal,
+            system_instruction="Return a plan",
+        )
+    )
+
+    assert plan.goal == "Structured fallback"
+    assert client.messages.schema_tool_request["tool_choice"] == {"type": "tool", "name": "emit_structured_result"}
+    assert client.messages.schema_tool_request["tools"][0]["input_schema"] == PlanProposal.model_json_schema()
 
 
 # 功能：验证终端订阅器收到 token 事件后立即原样输出且不追加换行。
