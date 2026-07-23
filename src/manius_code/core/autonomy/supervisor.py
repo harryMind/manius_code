@@ -307,7 +307,7 @@ class AutonomousSupervisor:
             self._context.run_id,
             self._context.step,
             self._context.goal,
-            PlanProposal(goal=plan.goal, steps=plan.steps),
+            PlanProposal.model_construct(goal=plan.goal, steps=plan.steps),
             self._history,
         )
         self._context.mark_success(summary)

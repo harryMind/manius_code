@@ -61,6 +61,8 @@ class FakeMessages:
         self.structured_request: dict[str, Any] | None = None
         self.schema_tool_request: dict[str, Any] | None = None
         self.invalid_structured_output = False
+        self.invalid_schema_tool_arguments = False
+        self.schema_tool_attempts = 0
 
     # 模拟 Anthropic messages.stream 并保存请求参数。
     def stream(self, **kwargs: Any) -> FakeStream:
@@ -103,6 +105,10 @@ class FakeMessages:
     # 模拟兼容端点使用受强制 tool_choice 约束的工具输入返回结构化结果。
     async def create(self, **kwargs: Any) -> FakeResponse:
         self.schema_tool_request = kwargs
+        self.schema_tool_attempts += 1
+        acceptance_criteria = [] if self.invalid_schema_tool_arguments and self.schema_tool_attempts == 1 else [
+            {"kind": "tool_result_contains", "expected": "ok"}
+        ]
         return FakeResponse(
             content=[
                 FakeBlock(
@@ -116,7 +122,7 @@ class FakeMessages:
                                 "id": "inspect",
                                 "title": "Inspect",
                                 "allowed_tools": ["read_file"],
-                                "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "ok"}],
+                                "acceptance_criteria": acceptance_criteria,
                             }
                         ],
                     },
@@ -200,6 +206,30 @@ def test_anthropic_provider_falls_back_to_forced_schema_tool_for_invalid_native_
     assert plan.goal == "Structured fallback"
     assert client.messages.schema_tool_request["tool_choice"] == {"type": "tool", "name": "emit_structured_result"}
     assert client.messages.schema_tool_request["tools"][0]["input_schema"] == PlanProposal.model_json_schema()
+
+
+# 功能：验证强制 Schema 工具首次漏填计划验收条件时会带着校验错误重试并返回可执行计划。
+# 设计：让替身的第一次工具参数为空列表、第二次合法，覆盖真实兼容端点忽略 minItems 后的自动修正边界。
+def test_anthropic_provider_retries_invalid_schema_tool_arguments() -> None:
+    event_bus = EventBus()
+    client = FakeClient()
+    client.messages.invalid_structured_output = True
+    client.messages.invalid_schema_tool_arguments = True
+    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
+
+    plan = asyncio.run(
+        provider.complete_structured(
+            "run-structured",
+            2,
+            [{"role": "user", "content": "Create a plan"}],
+            PlanProposal,
+            system_instruction="Return a plan",
+        )
+    )
+
+    assert plan.steps[0].acceptance_criteria[0].expected == "ok"
+    assert client.messages.schema_tool_attempts == 2
+    assert len(client.messages.schema_tool_request["messages"]) == 2
 
 
 # 功能：验证终端订阅器收到 token 事件后立即原样输出且不追加换行。

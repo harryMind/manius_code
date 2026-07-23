@@ -215,39 +215,58 @@ class AnthropicProvider:
         trace_id: str,
     ) -> tuple[Any, _StructuredModel]:
         tool_name = "emit_structured_result"
-        request_payload = {
-            "model": self._config.default_model,
-            "max_tokens": 4096,
-            "system": system_instruction,
-            "messages": messages,
-            "tools": [
-                {
-                    "name": tool_name,
-                    "description": "Return the requested structured result.",
-                    "input_schema": response_model.model_json_schema(),
-                }
-            ],
-            "tool_choice": {"type": "tool", "name": tool_name},
-        }
-        if self._tracer is not None:
-            self._tracer.emit(
-                "CORE>LLM",
-                "llm",
-                "request",
-                {"request": request_payload, "fallback_for": "output_config", "message_count": len(messages), "tool_count": 1},
-                run_id=run_id,
-                step=step,
-                trace_id=trace_id,
-            )
-        response = await client.messages.create(**request_payload)
-        for block in response.content:
-            if block.type != "tool_use" or block.name != tool_name:
-                continue
-            try:
-                return response, response_model.model_validate(block.input)
-            except ValidationError as error:
-                raise RuntimeError(f"LLM returned invalid {response_model.__name__} schema-tool arguments") from error
-        raise RuntimeError(f"LLM did not call required schema tool for {response_model.__name__}")
+        last_error = "required schema tool was not called"
+        for attempt in range(2):
+            request_messages = list(messages)
+            if attempt:
+                request_messages.append(
+                    {
+                        "role": "user",
+                        "content": f"The previous structured tool arguments failed validation: {last_error}. Correct every field and call the required tool again.",
+                    }
+                )
+            request_payload = {
+                "model": self._config.default_model,
+                "max_tokens": 4096,
+                "system": system_instruction,
+                "messages": request_messages,
+                "tools": [
+                    {
+                        "name": tool_name,
+                        "description": "Return the requested structured result.",
+                        "input_schema": response_model.model_json_schema(),
+                    }
+                ],
+                "tool_choice": {"type": "tool", "name": tool_name},
+            }
+            if self._tracer is not None:
+                self._tracer.emit(
+                    "CORE>LLM",
+                    "llm",
+                    "request",
+                    {
+                        "request": request_payload,
+                        "fallback_for": "output_config",
+                        "fallback_attempt": attempt + 1,
+                        "message_count": len(request_messages),
+                        "tool_count": 1,
+                    },
+                    run_id=run_id,
+                    step=step,
+                    trace_id=trace_id,
+                )
+            response = await client.messages.create(**request_payload)
+            for block in response.content:
+                if block.type != "tool_use" or block.name != tool_name:
+                    continue
+                try:
+                    return response, response_model.model_validate(block.input)
+                except ValidationError as error:
+                    last_error = str(error)
+                    break
+            else:
+                last_error = "required schema tool was not called"
+        raise RuntimeError(f"LLM returned invalid {response_model.__name__} schema-tool arguments: {last_error}")
 
     # 根据配置惰性创建 Anthropic 异步客户端。
     def _create_client(self) -> Any:

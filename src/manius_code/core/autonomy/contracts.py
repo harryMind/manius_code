@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 StepStatus = Literal["pending", "ready", "running", "verifying", "succeeded", "retryable", "replan_required", "failed"]
 ResolverAction = Literal["retry", "revise_step", "replan", "abort"]
@@ -33,6 +33,16 @@ class PlanStep(BaseModel):
 class PlanProposal(BaseModel):
     goal: str
     steps: list[PlanStep] = Field(min_length=1)
+
+    # 拒绝缺少可执行工具或可验证验收条件的模型计划，避免其进入调度器后才失败。
+    @model_validator(mode="after")
+    def _validate_executable_steps(self) -> "PlanProposal":
+        for step in self.steps:
+            if not step.allowed_tools:
+                raise ValueError(f"step {step.id} must declare allowed tools")
+            if not step.acceptance_criteria:
+                raise ValueError(f"step {step.id} must declare acceptance criteria")
+        return self
 
 
 class Plan(BaseModel):
