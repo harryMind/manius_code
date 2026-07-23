@@ -114,3 +114,13 @@ def test_structured_autonomy_provider_uses_tool_specific_action_schema() -> None
     assert schema["$defs"]["StructuredAction_read_file"]["properties"]["arguments"] == {
         "$ref": "#/$defs/ReadFileArguments"
     }
+
+
+# 功能：验证规划响应 Schema 将每步工具和验收列表声明为 API 可见的非空数组。
+# 设计：直接检查 Pydantic JSON Schema 的 minItems，而非仅构造对象，确保兼容供应商也能接收硬约束。
+def test_plan_proposal_schema_requires_non_empty_tools_and_acceptance_criteria() -> None:
+    schema = PlanProposal.model_json_schema()
+    step_schema = schema["$defs"]["PlannedStep"]
+
+    assert step_schema["properties"]["allowed_tools"]["minItems"] == 1
+    assert step_schema["properties"]["acceptance_criteria"]["minItems"] == 1
