@@ -5,6 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from manius_code.core.autonomy.contracts import PlanProposal
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import AgentEvent, LlmTokenEvent
@@ -23,6 +24,10 @@ class FakeBlock(BaseModel):
 
 class FakeResponse(BaseModel):
     content: list[FakeBlock]
+
+
+class FakeParsedResponse(FakeResponse):
+    parsed_output: Any = None
 
 
 class FakeStream:
@@ -53,6 +58,7 @@ class FakeMessages:
     # 保存请求参数并返回确定性的 Claude 内容块。
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
+        self.structured_request: dict[str, Any] | None = None
 
     # 模拟 Anthropic messages.stream 并保存请求参数。
     def stream(self, **kwargs: Any) -> FakeStream:
@@ -64,6 +70,27 @@ class FakeMessages:
                     FakeBlock(type="tool_use", id="tool-1", name="read_file", input={"path": "README.md"}),
                 ]
             )
+        )
+
+    # 模拟 SDK parse 接口接收 Pydantic 模型并返回已校验的 parsed_output。
+    async def parse(self, **kwargs: Any) -> FakeParsedResponse:
+        self.structured_request = kwargs
+        response_model = kwargs["output_format"]
+        return FakeParsedResponse(
+            content=[FakeBlock(type="text", text='{"goal":"Structured"}')],
+            parsed_output=response_model.model_validate(
+                {
+                    "goal": "Structured",
+                    "steps": [
+                        {
+                            "id": "inspect",
+                            "title": "Inspect",
+                            "allowed_tools": ["read_file"],
+                            "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "ok"}],
+                        }
+                    ],
+                }
+            ),
         )
 
 
@@ -94,6 +121,31 @@ def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
     assert [event.token for event in events if event.type == "llm_token"] == ["I will ", "read the file."]
     assert events[-1].type == "llm_response"
     assert events[-1].duration_ms >= 0
+
+
+# 功能：验证 AnthropicProvider 将 Pydantic 模型直接传给原生 messages.parse 并返回 parsed_output。
+# 设计：以 SDK 替身检查 output_format 参数对象身份，同时断言结构化路径不产生逐 token 事件或文本 JSON 解析依赖。
+def test_anthropic_provider_uses_native_pydantic_structured_output() -> None:
+    events: list[AgentEvent] = []
+    event_bus = EventBus()
+    event_bus.subscribe(events.append)
+    client = FakeClient()
+    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
+
+    plan = asyncio.run(
+        provider.complete_structured(
+            "run-structured",
+            2,
+            [{"role": "user", "content": "Create a plan"}],
+            PlanProposal,
+            system_instruction="Return a plan",
+        )
+    )
+
+    assert plan.goal == "Structured"
+    assert client.messages.structured_request["output_format"] is PlanProposal
+    assert client.messages.structured_request["system"] == "Return a plan"
+    assert [event.type for event in events] == ["llm_request", "llm_response"]
 
 
 # 功能：验证终端订阅器收到 token 事件后立即原样输出且不追加换行。

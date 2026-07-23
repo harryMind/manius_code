@@ -3,7 +3,7 @@ name = "manius-code"
 version = "0.0.1"
 description = "Local dual-process AI agent foundation"
 requires-python = ">=3.13"
-dependencies = ["anthropic>=0.80.0", "pydantic>=2.0", "textual>=0.50.0"]
+dependencies = ["anthropic>=0.116.0", "pydantic>=2.0", "textual>=0.50.0"]
 
 [project.scripts]
 manius-core = "manius_code.core.app:main"

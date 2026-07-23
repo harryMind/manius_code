@@ -212,7 +212,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", specifier = ">=0.80.0" },
+    { name = "anthropic", specifier = ">=0.116.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "textual", specifier = ">=0.50.0" },
 ]

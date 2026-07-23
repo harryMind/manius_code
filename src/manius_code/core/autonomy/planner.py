@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from typing import Protocol, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
-from manius_code.core.llm.models import LlmResponse
+from manius_code.core.autonomy.structured_models import action_response_model
 from manius_code.core.llm.provider import LlmProvider
 from manius_code.core.prompt import action_instruction, plan_instruction, resolver_instruction, summary_instruction
 
@@ -65,24 +65,23 @@ class StructuredAutonomyProvider:
                 "goal": goal,
                 "verified_memories": memories,
                 "available_tools": available_tools,
-                "schema": PlanProposal.model_json_schema(),
             },
             PlanProposal,
         )
 
     # 请求模型仅返回当前步骤允许的一个 ActionProposal。
     async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
-        return await self._request(
+        response = await self._request(
             run_id,
             step,
             action_instruction(),
             {
                 "plan_step": plan_step.model_dump(mode="json"),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
-                "schema": ActionProposal.model_json_schema(),
             },
-            ActionProposal,
+            action_response_model(plan_step.id, plan_step.allowed_tools),
         )
+        return ActionProposal.model_validate(response.action.model_dump(mode="json"))
 
     # 请求模型在失败后返回受限的 ResolverDecision。
     async def resolve(
@@ -103,7 +102,6 @@ class StructuredAutonomyProvider:
                 "plan_step": plan_step.model_dump(mode="json"),
                 "failure": result.model_dump(mode="json"),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
-                "schema": ResolverDecision.model_json_schema(),
             },
             ResolverDecision,
         )
@@ -131,7 +129,7 @@ class StructuredAutonomyProvider:
         )
         return response.text.strip()
 
-    # 通过统一的 JSON 提示、解析和 Pydantic 校验调用底层模型。
+    # 通过统一提示和原生 Pydantic 响应格式调用底层模型。
     async def _request(
         self,
         run_id: str,
@@ -140,24 +138,13 @@ class StructuredAutonomyProvider:
         payload: dict[str, object],
         model: type[_Model],
     ) -> _Model:
-        response = await self._provider.complete(
+        return await self._provider.complete_structured(
             run_id,
             step,
             [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            response_model=model,
             system_instruction=instruction,
-            emit_tokens=False,
         )
-        return self._parse_response(response, model)
-
-    # 将模型文本中的 JSON 转换为调用方要求的 Pydantic 契约。
-    def _parse_response(self, response: LlmResponse, model: type[_Model]) -> _Model:
-        content = response.text.strip()
-        if content.startswith("```") and content.endswith("```"):
-            content = content.split("\n", 1)[1].rsplit("\n", 1)[0]
-        try:
-            return model.model_validate(json.loads(content))
-        except (json.JSONDecodeError, ValidationError) as error:
-            raise RuntimeError(f"LLM returned invalid {model.__name__} JSON: {error}") from error
 
 
 class Planner:

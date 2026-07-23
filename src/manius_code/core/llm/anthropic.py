@@ -1,5 +1,5 @@
 import time
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -10,6 +10,8 @@ from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTo
 from manius_code.core.llm.models import LlmResponse, ToolCall
 from manius_code.core.prompt import legacy_agent_instruction
 from manius_code.core.tracing import TracingProvider
+
+_StructuredModel = TypeVar("_StructuredModel", bound=BaseModel)
 
 class AnthropicProvider:
     # 注入 Claude 配置、事件总线和可选的异步 SDK 客户端。
@@ -104,6 +106,83 @@ class AnthropicProvider:
             )
         )
         return result
+
+    # 直接将 Pydantic 响应模型交给 Anthropic 原生 parse 接口并返回 API 约束后的结果。
+    async def complete_structured(
+        self,
+        run_id: str,
+        step: int,
+        messages: list[dict[str, Any]],
+        response_model: type[_StructuredModel],
+        system_instruction: str | None = None,
+    ) -> _StructuredModel:
+        await self._event_bus.publish(LlmRequestEvent(run_id=run_id, step=step, messages=messages))
+        client = self._client or self._create_client()
+        self._client = client
+        started_at = time.monotonic()
+        trace_id = uuid4().hex
+        request_payload = {
+            "model": self._config.default_model,
+            "max_tokens": 4096,
+            "system": system_instruction or legacy_agent_instruction(),
+            "messages": messages,
+            "output_config": {
+                "format": {
+                    "type": "json_schema",
+                    "schema": response_model.model_json_schema(),
+                }
+            },
+        }
+        if self._tracer is not None:
+            self._tracer.emit(
+                "CORE>LLM",
+                "llm",
+                "request",
+                {
+                    "request": request_payload,
+                    "message_count": len(messages),
+                    "tool_count": 0,
+                },
+                run_id=run_id,
+                step=step,
+                trace_id=trace_id,
+            )
+        response = await client.messages.parse(
+            model=self._config.default_model,
+            max_tokens=4096,
+            system=system_instruction or legacy_agent_instruction(),
+            messages=messages,
+            output_format=response_model,
+        )
+        if self._tracer is not None:
+            response_payload = self._response_payload(response)
+            self._tracer.emit(
+                "LLM>CORE",
+                "llm",
+                "response",
+                {
+                    "response": response_payload,
+                    "usage": response_payload.get("usage", {}),
+                    "content_block_count": len(response_payload.get("content", [])),
+                },
+                run_id=run_id,
+                step=step,
+                trace_id=trace_id,
+            )
+        parsed_output = response.parsed_output
+        if not isinstance(parsed_output, response_model):
+            raise RuntimeError(f"LLM did not return a valid {response_model.__name__} structured output")
+        text = "\n".join(block.text for block in response.content if block.type == "text")
+        await self._event_bus.publish(
+            LlmResponseEvent(
+                run_id=run_id,
+                step=step,
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                text=text,
+                tool_calls=[],
+            )
+        )
+        return parsed_output
 
     # 根据配置惰性创建 Anthropic 异步客户端。
     def _create_client(self) -> Any:
