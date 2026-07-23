@@ -9,30 +9,32 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from manius_code.core.bus.commands import AgentRunResult, EventListResult, EventSubscribeResult
-from manius_code.core.config import ManiusConfig
 from manius_code.core.bus.events import AgentEvent, RunFinishedEvent
+from manius_code.core.config import ManiusConfig
 from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.transport.socket_client import IpcError, SocketClient
 
 _EVENT_ADAPTER = TypeAdapter(AgentEvent)
 
 
-# 向 CLI 解析器注册前台 Agent 运行命令。
+# 向 CLI 注册新建任务和恢复已停止任务的前台观察命令。
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     parser = subparsers.add_parser("run", help="Run an Agent task in the foreground")
     parser.add_argument("--goal", required=True, help="Task goal for the Agent")
     parser.set_defaults(handler=run)
+    resume_parser = subparsers.add_parser("resume", help="Resume a stopped Agent task in the foreground")
+    resume_parser.add_argument("--run-id", required=True, help="Stopped Agent run identifier")
+    resume_parser.set_defaults(handler=resume)
 
 
-# 运行 Agent 并以进程状态码表示任务是否成功完成。
-# 通过订阅、远程调用和完成事件等待执行一次 daemon 托管任务。
-async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
+# 复用历史回放、精确订阅和完成等待逻辑观察一次远程运行或恢复请求。
+async def _watch_remote(config: ManiusConfig, method: str, params: dict[str, Any]) -> RunFinishedEvent:
     printer = StdoutPrinter()
     finished_events: dict[str, RunFinishedEvent] = {}
     finished_signal = asyncio.Event()
     sub_id: str | None = None
 
-    # 渲染服务端事件，并记录已结束的远程运行。 处理服务端推送的event
+    # 校验并渲染一条历史或实时事件，同时记录任意运行的完成态。
     async def consume_event(message: dict[str, Any], render: bool = True) -> None:
         try:
             event = _EVENT_ADAPTER.validate_python(message)
@@ -42,14 +44,15 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
             printer.handle(event)
         if isinstance(event, RunFinishedEvent):
             finished_events[event.run_id] = event
-            finished_signal.set() # 唤醒在服务端的await事件
+            finished_signal.set()
 
-    # 等待目标运行的完成事件，并保留其他订阅任务的事件。
-    # 将实时推送事件交给统一的事件消费逻辑。
+    # 将 SocketClient 推送统一交给历史回放也会使用的事件消费逻辑。
     async def handle_event(message: dict[str, Any]) -> None:
         await consume_event(message)
 
-    # 精确等待指定运行任务的完成事件，忽略其他任务的完成通知。
+    client = SocketClient(config.host, config.port, event_handler=handle_event)
+
+    # 精确等待目标 run_id 的完成事件，并在事件流异常关闭时返回 IPC 错误。
     async def wait_for_finished(run_id: str) -> RunFinishedEvent:
         while True:
             if run_id in finished_events:
@@ -76,11 +79,9 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
                 raise IpcError(-32000, f"Event stream closed before run finished{detail}")
             finished_signal.clear()
 
-    client = SocketClient(config.host, config.port, event_handler=handle_event)
     try:
         await client.connect()
-        response = await client.send_command("agent.run", {"type": "agent.run", "goal": goal})
-        started = AgentRunResult.model_validate(response.result)
+        started = AgentRunResult.model_validate((await client.send_command(method, params)).result)
         history = EventListResult.model_validate(
             (await client.send_command("event.list", {"type": "event.list", "run_id": started.run_id})).result
         )
@@ -114,10 +115,30 @@ async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
                 await client.close()
 
 
-# 运行远程 Agent 并以最终事件状态表示命令是否成功完成。
+# 发起新的 agent.run 请求并持续观察该任务直到收到完成事件。
+async def _run_remote(config: ManiusConfig, goal: str) -> RunFinishedEvent:
+    return await _watch_remote(config, "agent.run", {"type": "agent.run", "goal": goal})
+
+
+# 发起 agent.resume 请求并持续观察恢复后的同一任务直到再次完成。
+async def _resume_remote(config: ManiusConfig, run_id: str) -> RunFinishedEvent:
+    return await _watch_remote(config, "agent.resume", {"type": "agent.resume", "run_id": run_id})
+
+
+# 执行新建任务命令并以完成事件状态映射进程退出码。
 def run(config: ManiusConfig, goal: str) -> None:
+    _exit_for_finished_event(_run_remote, config, goal)
+
+
+# 执行恢复任务命令并以完成事件状态映射进程退出码。
+def resume(config: ManiusConfig, run_id: str) -> None:
+    _exit_for_finished_event(_resume_remote, config, run_id)
+
+
+# 统一输出 IPC 或数据校验错误，并将失败完成事件转换为非零退出码。
+def _exit_for_finished_event(remote, config: ManiusConfig, argument: str) -> None:
     try:
-        finished_event = asyncio.run(_run_remote(config, goal))
+        finished_event = asyncio.run(remote(config, argument))
     except IpcError as error:
         print(f"manius: IPC request failed: {error}", file=sys.stderr)
         raise SystemExit(1) from None

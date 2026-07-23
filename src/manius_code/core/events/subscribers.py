@@ -16,6 +16,7 @@ class StdoutPrinter:
         # ANSI 颜色码：按事件层级/状态区分视觉样式
         self._COLORS = {
             "run_started": "\033[94m",       # 亮蓝 - 任务启动
+            "run_resumed": "\033[94m",       # 亮蓝 - 任务恢复
             "step_planning": "\033[96m",     # 亮青 - 步骤规划
             "tool_call_start": "\033[93m",   # 亮黄 - 工具调用中
             "tool_call_success": "\033[92m", # 亮绿 - 工具成功
@@ -40,6 +41,10 @@ class StdoutPrinter:
             case "run_started":
                 color = self._COLORS["run_started"]
                 content = f"▶ Run Started | ID: {event.run_id}\n  Goal: {event.goal}"
+
+            case "run_resumed":
+                color = self._COLORS["run_resumed"]
+                content = f"▶ Run Resumed | ID: {event.run_id}\n  Goal: {event.goal}"
 
             case "step_planning":
                 color = self._COLORS["step_planning"]

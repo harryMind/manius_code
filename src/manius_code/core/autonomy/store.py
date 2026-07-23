@@ -81,6 +81,36 @@ class PlanStore:
         finally:
             self._release_lock()
 
+    # 读取持久化的步骤尝试事实以恢复后续规划和修复所需的历史上下文。
+    def load_attempts(self) -> list[StepResult]:
+        self._acquire_lock()
+        try:
+            if not self._attempts_path.is_file():
+                return []
+            attempts: list[StepResult] = []
+            for line_number, line in enumerate(self._attempts_path.read_text(encoding="utf-8").splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    attempts.append(StepResult.model_validate_json(line))
+                except ValueError as error:
+                    raise ValueError(f"invalid attempt record at line {line_number}: {self._attempts_path}") from error
+            return attempts
+        finally:
+            self._release_lock()
+
+    # 将中断时残留的运行中状态改为可重试状态，终态任务由运行层依据完成事件判定。
+    def load_resumable(self) -> Plan:
+        plan = self.load()
+        failed_steps = [step.id for step in plan.steps if step.status == "failed"]
+        if failed_steps:
+            raise ValueError(f"failed plan cannot be resumed: {', '.join(failed_steps)}")
+        for step in plan.steps:
+            if step.status in {"running", "verifying"}:
+                step.status = "retryable"
+        self.save_state(plan)
+        return plan
+
     # 返回当前计划状态中的指定步骤以集中处理不存在错误。
     def step(self, plan: Plan, step_id: str) -> PlanStep:
         for step in plan.steps:

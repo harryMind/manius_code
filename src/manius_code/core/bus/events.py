@@ -24,6 +24,14 @@ class RunStartedEvent(BaseEvent):
     run_dir: str
 
 
+# 标识守护进程从已持久化计划恢复一次中断任务。
+class RunResumedEvent(BaseEvent):
+    type: Literal["run_resumed"] = "run_resumed"
+    goal: str
+    run_dir: str
+    previous_step: int
+
+
 class RunFinishedEvent(BaseEvent):
     type: Literal["run_finished"] = "run_finished"
     status: Literal["success", "failed"]
@@ -108,6 +116,7 @@ class LlmResponseEvent(BaseEvent):
 
 AgentEvent = Annotated[
     RunStartedEvent
+    | RunResumedEvent
     | RunFinishedEvent
     | StepPlanningEvent
     | StepDoneEvent
@@ -133,6 +142,7 @@ class EventPushEnvelope(BaseModel):
 Event = Annotated[
     CoreStartedEvent
     | RunStartedEvent
+    | RunResumedEvent
     | RunFinishedEvent
     | StepPlanningEvent
     | StepDoneEvent

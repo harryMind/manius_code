@@ -8,7 +8,7 @@ from manius_code.core.autonomy.store import PlanStore, PlanStoreLockError
 
 
 # 功能：验证批量接口会提升依赖已满足的步骤并稳定返回全部 ready 步骤。
-# 设计：同时构造已完成、待解锁和 retryable 步骤，确保并行候选不会混入串行重试队列。
+# 设计：同时构造已完成、待解锁和 retryable 步骤，确保批量接口会统一返回所有可调度工作。
 def test_scheduler_returns_all_ready_steps_in_stable_order() -> None:
     plan = Plan(
         version=1,
@@ -23,8 +23,9 @@ def test_scheduler_returns_all_ready_steps_in_stable_order() -> None:
 
     ready = Scheduler().ready_steps(plan)
 
-    assert [step.id for step in ready] == ["inspect", "write"]
+    assert [step.id for step in ready] == ["inspect", "retry", "write"]
     assert plan.steps[1].status == "ready"
+    assert plan.steps[3].status == "ready"
     assert Scheduler().next_ready_step(plan).id == "inspect"
 
 

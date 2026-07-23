@@ -29,8 +29,14 @@ class AgentRunCommand(BaseModel):
     goal: str = Field(min_length=1)
 
 
+# 恢复指定运行目录中已持久化且仍可继续调度的计划。
+class AgentResumeCommand(BaseModel):
+    type: Literal["agent.resume"] = "agent.resume"
+    run_id: str = Field(pattern="^[A-Za-z0-9_-]+$")
+
+
 Command = Annotated[
-    PingCommand | EventSubscribeCommand | EventUnsubscribeCommand | EventListCommand | AgentRunCommand,
+    PingCommand | EventSubscribeCommand | EventUnsubscribeCommand | EventListCommand | AgentRunCommand | AgentResumeCommand,
     Field(discriminator="type"),
 ]
 

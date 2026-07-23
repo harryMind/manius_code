@@ -56,12 +56,12 @@ def test_tui_updates_tool_call_block_in_place() -> None:
                 ToolCallStartEvent(run_id="run-a", tool_name="read_file", arguments={"path": "README.md"}).model_dump(mode="json")
             )
             await pilot.pause()
-            block = app._tool_blocks[("run-a", "read_file")]
+            block = app._tool_blocks[("run-a", 0, "read_file")]
             await app.handle_event(
                 ToolCallSuccessEvent(run_id="run-a", tool_name="read_file", duration_ms=5, result="content").model_dump(mode="json")
             )
             await pilot.pause()
-            assert ("run-a", "read_file") not in app._tool_blocks
+            assert ("run-a", 0, "read_file") not in app._tool_blocks
             assert block._duration_ms == 5
             assert block._error is None
             assert block._result == "content"

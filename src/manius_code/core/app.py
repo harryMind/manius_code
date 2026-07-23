@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.bus.commands import AgentRunCommand, AgentRunResult, EventListCommand, EventListResult, EventSubscribeCommand, EventSubscribeResult, EventUnsubscribeCommand, EventUnsubscribeResult, PingCommand, PongResult
+from manius_code.core.bus.commands import AgentResumeCommand, AgentRunCommand, AgentRunResult, EventListCommand, EventListResult, EventSubscribeCommand, EventSubscribeResult, EventUnsubscribeCommand, EventUnsubscribeResult, PingCommand, PongResult
 from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.config import ManiusConfig, load_config
 from manius_code.core.events.bus import EventBus
@@ -29,6 +29,7 @@ class CoreApp:
         self._config: ManiusConfig | None = None
         self._event_broadcaster = IpcEventBroadcaster()
         self._agent_tasks: set[asyncio.Task[Any]] = set()
+        self._active_run_ids: set[str] = set()
         self._runs_dir = Path("runs")
         self._tracer: TracingProvider | None = None
 
@@ -76,9 +77,25 @@ class CoreApp:
                 tracer=self._tracer,
             )
             task = asyncio.create_task(runner.run(command.goal, run_id))
-        self._agent_tasks.add(task)
-        task.add_done_callback(self._record_agent_task_result)
+        self._track_agent_task(run_id, task)
         return AgentRunResult(run_id=run_id)
+
+    # 恢复已停止且持久化计划仍未完成的任务，并拒绝同一运行的重复恢复。
+    async def _agent_resume_handler(self, params: dict[str, Any]) -> AgentRunResult:
+        if self._config is None:
+            raise RuntimeError("CoreApp configuration is not initialized")
+        command = AgentResumeCommand.model_validate(params)
+        if command.run_id in self._active_run_ids:
+            raise RuntimeError(f"run is already active: {command.run_id}")
+        runner = AgentRunner(
+            self._config,
+            event_subscribers=[self._event_broadcaster.handle],
+            tracer=self._tracer,
+        )
+        runner.validate_resume(command.run_id)
+        task = asyncio.create_task(runner.resume(command.run_id))
+        self._track_agent_task(command.run_id, task)
+        return AgentRunResult(run_id=command.run_id)
 
     # 为参数校验失败的远程任务持久化并广播完整的失败事件闭环。
     async def _publish_failed_run(self, run_id: str, reason: str) -> None:
@@ -103,9 +120,16 @@ class CoreApp:
         finally:
             writer.close()
 
-    # 回收已结束的后台任务并记录未处理的运行异常。
-    def _record_agent_task_result(self, task: asyncio.Task[Any]) -> None:
+    # 注册后台任务及其运行标识，供恢复接口识别正在执行的任务。
+    def _track_agent_task(self, run_id: str, task: asyncio.Task[Any]) -> None:
+        self._agent_tasks.add(task)
+        self._active_run_ids.add(run_id)
+        task.add_done_callback(lambda completed: self._record_agent_task_result(run_id, completed))
+
+    # 回收结束任务、解除运行占用并记录未处理的后台异常。
+    def _record_agent_task_result(self, run_id: str, task: asyncio.Task[Any]) -> None:
         self._agent_tasks.discard(task)
+        self._active_run_ids.discard(run_id)
         if task.cancelled():
             return
         exception = task.exception()
@@ -146,6 +170,7 @@ class CoreApp:
         server.register("event.unsubscribe", self._event_unsubscribe_handler)
         server.register("event.list", self._event_list_handler)
         server.register("agent.run", self._agent_run_handler)
+        server.register("agent.resume", self._agent_resume_handler)
         server.add_disconnect_handler(self._event_broadcaster.unsubscribe_writer)
 
         try:

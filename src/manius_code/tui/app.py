@@ -160,7 +160,7 @@ class ManiusTui(App[None]):
         self._socket_worker: Worker[None] | None = None
         self._token_buffers: dict[str, str] = {}
         self._stream_blocks: dict[str, LlmStreamBlock] = {}
-        self._tool_blocks: dict[tuple[str, str], ToolCallBlock] = {}
+        self._tool_blocks: dict[tuple[str, int, str], ToolCallBlock] = {}
 
     # 组合状态栏和可滚动的组件化事件视图。
     def compose(self) -> ComposeResult:
@@ -261,6 +261,13 @@ class ManiusTui(App[None]):
                         classes="run-header",
                     )
                 )
+            case "run_resumed":
+                self._append(
+                    Static(
+                        f"resumed  [cyan]{event.run_id}[/cyan]  [dim]{_preview(event.goal)}[/dim]",
+                        classes="run-header",
+                    )
+                )
             case "step_planning":
                 self._append(Static(f"step {event.step}  [cyan]{event.plan}[/cyan]", classes="step-divider"))
             case "step_done":
@@ -268,12 +275,12 @@ class ManiusTui(App[None]):
                     self._append(Static(f"  [dim]{_preview(event.observation)}[/dim]", classes="log-line"))
             case "tool_call_start":
                 block = ToolCallBlock(event.tool_name, event.arguments)
-                self._tool_blocks[(event.run_id, event.tool_name)] = block
+                self._tool_blocks[(event.run_id, event.step, event.tool_name)] = block
                 self._append(block)
             case "tool_call_success":
-                self._finish_tool(event.run_id, event.tool_name, event.duration_ms, result=event.result)
+                self._finish_tool(event.run_id, event.step, event.tool_name, event.duration_ms, result=event.result)
             case "tool_call_failed":
-                self._finish_tool(event.run_id, event.tool_name, event.duration_ms, event.error)
+                self._finish_tool(event.run_id, event.step, event.tool_name, event.duration_ms, event.error)
             case "run_finished":
                 self._append(self._run_finished_widget(event))
 
@@ -311,12 +318,13 @@ class ManiusTui(App[None]):
     def _finish_tool(
         self,
         run_id: str,
+        step: int,
         tool_name: str,
         duration_ms: int,
         error: str | None = None,
         result: str | None = None,
     ) -> None:
-        block = self._tool_blocks.pop((run_id, tool_name), None)
+        block = self._tool_blocks.pop((run_id, step, tool_name), None)
         if block is None:
             status = "failed" if error else "done"
             detail = f": {error}" if error else ""

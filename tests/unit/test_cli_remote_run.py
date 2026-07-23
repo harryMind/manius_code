@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from manius_code.cli.commands.run import _run_remote, run
+from manius_code.cli.commands.run import _resume_remote, _run_remote, run
 from manius_code.core.bus.commands import AgentRunResult, EventListResult, EventSubscribeResult, EventUnsubscribeResult
 from manius_code.core.bus.events import LlmRequestEvent, RunFinishedEvent, RunStartedEvent
 from manius_code.core.config import ManiusConfig
@@ -130,3 +130,65 @@ def test_cli_remote_run_fails_when_event_stream_closes_before_completion(free_po
             await server.stop()
 
     asyncio.run(exercise())
+
+
+# 功能：验证 CLI resume 会发送 agent.resume、订阅相同 run_id 并消费恢复后的完成事件。
+# 设计：使用最小 JSON-RPC 服务替身同时检查恢复参数与订阅范围，避免仅复用 run 测试而遗漏新命令协议。
+def test_cli_remote_resume_observes_the_resumed_run(free_port: int) -> None:
+    # 启动一个在订阅建立后发送恢复完成事件的本地服务端。
+    async def exercise() -> RunFinishedEvent:
+        broadcaster = IpcEventBroadcaster()
+        history: dict[str, list[dict[str, Any]]] = {}
+        server = SocketServer("127.0.0.1", free_port)
+
+        # 返回恢复任务已有的 run_resumed 历史事件与目标任务标识。
+        async def resume_agent(params: dict[str, Any]) -> AgentRunResult:
+            assert params == {"type": "agent.resume", "run_id": "stopped-run"}
+            history["stopped-run"] = [
+                RunStartedEvent(run_id="stopped-run", goal="saved goal", run_dir="runs/stopped-run").model_dump(mode="json")
+            ]
+            return AgentRunResult(run_id="stopped-run")
+
+        # 返回指定任务到当前时刻的历史事件。
+        async def list_events(params: dict[str, Any]) -> dict[str, Any]:
+            return EventListResult(run_id=params["run_id"], events=history.get(params["run_id"], [])).model_dump()
+
+        # 建立精确订阅后广播同一运行的完成事件。
+        async def subscribe(params: dict[str, Any], writer: asyncio.StreamWriter) -> dict[str, Any]:
+            assert params["run_id"] == "stopped-run"
+            sub_id = broadcaster.subscribe(writer, params["run_id"], params["topics"])
+
+            # 将完成事件留给实时推送路径，以覆盖恢复后的等待逻辑。
+            async def finish() -> None:
+                await asyncio.sleep(0.01)
+                completed = RunFinishedEvent(
+                    run_id="stopped-run",
+                    status="success",
+                    total_steps=2,
+                    duration_ms=1,
+                    summary="resumed",
+                )
+                history["stopped-run"].append(completed.model_dump(mode="json"))
+                broadcaster.handle(completed)
+
+            asyncio.create_task(finish())
+            return EventSubscribeResult(sub_id=sub_id, run_id=params["run_id"], topics=params["topics"]).model_dump()
+
+        # 确认客户端 finally 块的退订请求能够获得合法 JSON-RPC 响应。
+        async def unsubscribe(_params: dict[str, Any]) -> dict[str, bool]:
+            return EventUnsubscribeResult(unsubscribed=True).model_dump()
+
+        server.register("agent.resume", resume_agent)
+        server.register("event.list", list_events)
+        server.register_connection_handler("event.subscribe", subscribe)
+        server.register("event.unsubscribe", unsubscribe)
+        await server.start()
+        try:
+            return await asyncio.wait_for(_resume_remote(ManiusConfig(port=free_port), "stopped-run"), timeout=2)
+        finally:
+            await server.stop()
+
+    finished = asyncio.run(exercise())
+
+    assert finished.run_id == "stopped-run"
+    assert finished.status == "success"
