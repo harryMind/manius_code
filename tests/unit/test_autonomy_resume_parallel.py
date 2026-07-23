@@ -10,6 +10,7 @@ from manius_code.core.autonomy.store import PlanStore
 from manius_code.core.autonomy.supervisor import AutonomousSupervisor
 from manius_code.core.config import ManiusConfig
 from manius_code.core.events.bus import EventBus
+from manius_code.core.tools.defaults import default_tool_catalog
 
 
 class ResumableProvider:
@@ -173,6 +174,7 @@ def test_supervisor_executes_ready_steps_in_parallel(tmp_path: Path) -> None:
             tmp_path / "run",
             tmp_path,
             AutonomyPolicy(max_steps=3),
+            default_tool_catalog(ManiusConfig()),
         )
         in_flight = 0
         maximum_in_flight = 0

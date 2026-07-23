@@ -15,6 +15,7 @@ class ReadFileArguments(BaseModel):
 
 class ReadFileTool:
     name = "read_file"
+    arguments_model = ReadFileArguments
     definition = {
         "name": name,
         "description": "Read a UTF-8 text file from the local workspace.",

@@ -26,6 +26,10 @@ class LlmConfig(BaseModel):
     default_base_url: str | None = None
 
 
+class TavilyConfig(BaseModel):
+    api_key: str | None = None
+
+
 class TraceConfig(BaseModel):
     enabled: bool = True
     file: Path = Field(default_factory=lambda: Path.home() / ".manius" / "traces" / "daemon.jsonl")
@@ -42,6 +46,7 @@ class ManiusConfig(BaseModel):
     # 日志配置
     log: LogConfig = Field(default_factory=LogConfig)
     llm: LlmConfig = Field(default_factory=LlmConfig)
+    tavily: TavilyConfig = Field(default_factory=TavilyConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
     max_steps: int = Field(default=20, ge=1)
 
@@ -70,21 +75,28 @@ def _environment_values(values: dict[str, str]) -> dict[str, object]:
     prefix = "MANIUS_"
     mapped: dict[str, object] = {}
     llm_values: dict[str, str] = {}
+    tavily_values: dict[str, str] = {}
     trace_values: dict[str, str] = {}
     for key, value in values.items():
         uppercase_key = key.upper()
         if uppercase_key == "ANTHROPIC_API_KEY":
             llm_values["api_key"] = value
+        elif uppercase_key == "TAVILY_API_KEY":
+            tavily_values["api_key"] = value
         elif uppercase_key.startswith(prefix):
             config_key = key[len(prefix) :].lower()
             if config_key.startswith("llm_"):
                 llm_values[config_key.removeprefix("llm_")] = value
+            elif config_key.startswith("tavily_"):
+                tavily_values[config_key.removeprefix("tavily_")] = value
             elif config_key.startswith("trace_"):
                 trace_values[config_key.removeprefix("trace_")] = value
             else:
                 mapped[config_key] = value
     if llm_values:
         mapped["llm"] = llm_values
+    if tavily_values:
+        mapped["tavily"] = tavily_values
     if trace_values:
         mapped["trace"] = trace_values
     return mapped

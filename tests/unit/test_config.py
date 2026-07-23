@@ -36,3 +36,11 @@ def test_load_config_maps_trace_environment_values(tmp_path: Path) -> None:
     assert config.trace.max_queue_size == 32
     assert config.trace.max_size_mb == 12
     assert config.trace.backup_count == 3
+
+
+# 功能：验证 Tavily API 密钥可经专属环境变量进入可选联网工具配置。
+# 设计：只加载配置而不创建 SDK 客户端，覆盖配置层映射并避免测试访问外部网络。
+def test_load_config_maps_tavily_api_key(tmp_path: Path) -> None:
+    config = load_config(tmp_path, {"MANIUS_TAVILY_API_KEY": "tvly-test"})
+
+    assert config.tavily.api_key == "tvly-test"

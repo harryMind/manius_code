@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Protocol, TypeVar
+from typing import Mapping, Protocol, TypeVar
 
 from pydantic import BaseModel
 
@@ -45,8 +45,9 @@ class AutonomyProvider(Protocol):
 
 class StructuredAutonomyProvider:
     # 注入任意满足通用 LLM 契约的实现，隔离厂商 SDK 与自主规划逻辑。
-    def __init__(self, provider: LlmProvider) -> None:
+    def __init__(self, provider: LlmProvider, tool_argument_models: Mapping[str, type[BaseModel]]) -> None:
         self._provider = provider
+        self._tool_argument_models = tool_argument_models
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
     async def plan(
@@ -79,7 +80,7 @@ class StructuredAutonomyProvider:
                 "plan_step": plan_step.model_dump(mode="json"),
                 "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
             },
-            action_response_model(plan_step.id, plan_step.allowed_tools),
+            action_response_model(plan_step.id, plan_step.allowed_tools, self._tool_argument_models),
         )
         return ActionProposal.model_validate(response.action.model_dump(mode="json"))
 

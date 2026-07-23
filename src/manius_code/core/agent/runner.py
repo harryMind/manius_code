@@ -20,6 +20,8 @@ from manius_code.core.events.bus import EventBus, Subscriber
 from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.llm.anthropic import AnthropicProvider
 from manius_code.core.tracing import TracingProvider
+from manius_code.core.tools.catalog import ToolCatalog
+from manius_code.core.tools.defaults import default_tool_catalog
 
 
 class RunSummary(BaseModel):
@@ -38,12 +40,14 @@ class AgentRunner:
         config: ManiusConfig,
         runs_dir: Path = Path("runs"),
         provider_factory: Callable[[EventBus], AutonomyProvider] | None = None,
+        tool_factory: Callable[[ManiusConfig], ToolCatalog] = default_tool_catalog,
         event_subscribers: list[Subscriber] | None = None,
         tracer: TracingProvider | None = None,
     ) -> None:
         self._config = config
         self._runs_dir = runs_dir
         self._provider_factory = provider_factory
+        self._tool_factory = tool_factory
         self._event_subscribers = event_subscribers or []
         self._tracer = tracer
 
@@ -89,7 +93,8 @@ class AgentRunner:
         context = ExecutionContext(run_id=run_id, goal=goal, step=previous_step)
         if plan is None:
             context.initialize()
-        provider = self._make_provider(event_bus)
+        tools = self._tool_factory(self._config)
+        provider = self._make_provider(event_bus, tools)
         supervisor = AutonomousSupervisor(
             context,
             provider,
@@ -97,6 +102,7 @@ class AgentRunner:
             run_dir,
             Path.cwd(),
             AutonomyPolicy(max_steps=self._config.max_steps),
+            tools,
         )
 
         started_at = time.monotonic()
@@ -189,7 +195,10 @@ class AgentRunner:
         return highest_step
 
     # 按注入的测试替身或默认 Anthropic 适配器构造结构化自主规划 Provider。
-    def _make_provider(self, event_bus: EventBus) -> AutonomyProvider:
+    def _make_provider(self, event_bus: EventBus, tools: ToolCatalog) -> AutonomyProvider:
         if self._provider_factory is not None:
             return self._provider_factory(event_bus)
-        return StructuredAutonomyProvider(AnthropicProvider(self._config.llm, event_bus, [], tracer=self._tracer))
+        return StructuredAutonomyProvider(
+            AnthropicProvider(self._config.llm, event_bus, [], tracer=self._tracer),
+            tools.argument_models(),
+        )

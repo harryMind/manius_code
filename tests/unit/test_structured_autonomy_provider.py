@@ -6,7 +6,9 @@ from pydantic import BaseModel
 
 from manius_code.core.autonomy.contracts import PlanProposal, PlanStep
 from manius_code.core.autonomy.planner import StructuredAutonomyProvider
+from manius_code.core.config import ManiusConfig
 from manius_code.core.prompt import plan_instruction
+from manius_code.core.tools.defaults import default_tool_catalog
 
 
 class FakeLlmProvider:
@@ -65,7 +67,7 @@ def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> N
         ],
     }
     llm = FakeLlmProvider(json.dumps(response))
-    provider = StructuredAutonomyProvider(llm)
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
 
     plan = asyncio.run(provider.plan("run-1", 0, "Read README", [], ["read_file"]))
 
@@ -91,7 +93,7 @@ def test_structured_autonomy_provider_uses_tool_specific_action_schema() -> None
             }
         )
     )
-    provider = StructuredAutonomyProvider(llm)
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
 
     action = asyncio.run(
         provider.action(

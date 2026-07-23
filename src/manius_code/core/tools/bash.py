@@ -15,6 +15,7 @@ class BashArguments(BaseModel):
 
 class BashTool:
     name = "bash"
+    arguments_model = BashArguments
     definition = {
         "name": name,
         "description": "Run one shell command in the workspace. Returns combined stdout and stderr, capped at 64KB.",

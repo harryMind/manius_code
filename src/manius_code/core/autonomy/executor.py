@@ -1,32 +1,24 @@
 from __future__ import annotations
 
 import time
-from typing import Any
 
 from manius_code.core.autonomy.contracts import ActionProposal, StepResult
 from manius_code.core.bus.events import ToolCallFailedEvent, ToolCallStartEvent, ToolCallSuccessEvent
 from manius_code.core.events.bus import EventBus
-from manius_code.core.tools.bash import BashTool
-from manius_code.core.tools.file_tools import ListDirTool, WriteFileTool
+from manius_code.core.tools.catalog import ToolCatalog
 from manius_code.core.tools.invocation import ToolExecutionError
-from manius_code.core.tools.read_file import ReadFileTool
 
 
 class Executor:
     # 注入运行标识、事件总线和新执行路径复用的实际工具实现。
-    def __init__(self, run_id: str, event_bus: EventBus) -> None:
+    def __init__(self, run_id: str, event_bus: EventBus, tools: ToolCatalog) -> None:
         self._run_id = run_id
         self._event_bus = event_bus
-        self._tools: dict[str, Any] = {
-            "read_file": ReadFileTool(),
-            "write_file": WriteFileTool(),
-            "list_dir": ListDirTool(),
-            "bash": BashTool(),
-        }
+        self._tools = tools
 
     # 返回新执行器允许审计的工具名称而不注册旧 ToolRegistry。
     def tool_names(self) -> set[str]:
-        return set(self._tools)
+        return self._tools.names()
 
     # 审计通过后执行一个步骤动作并发布既有工具调用事件。
     async def execute(self, proposal: ActionProposal, step: int, attempt: int) -> StepResult:
@@ -40,7 +32,7 @@ class Executor:
         )
         started_at = time.monotonic()
         try:
-            tool = self._tools[proposal.tool_name]
+            tool = self._tools.get(proposal.tool_name)
             result = await tool.execute(proposal.arguments)
         except Exception as error:
             if isinstance(error, KeyError):

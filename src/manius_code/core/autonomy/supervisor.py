@@ -23,6 +23,7 @@ from manius_code.core.bus.events import (
 )
 from manius_code.core.events.bus import EventBus
 from manius_code.core.memory.store import MemoryStore
+from manius_code.core.tools.catalog import ToolCatalog
 
 
 class AutonomousSupervisor:
@@ -35,6 +36,7 @@ class AutonomousSupervisor:
         run_dir: Path,
         workspace: Path,
         policy: AutonomyPolicy,
+        tools: ToolCatalog,
     ) -> None:
         self._context = context
         self._provider = provider
@@ -42,7 +44,7 @@ class AutonomousSupervisor:
         self._policy = policy
         self._planner = Planner(provider)
         self._resolver = Resolver(provider)
-        self._executor = Executor(context.run_id, event_bus)
+        self._executor = Executor(context.run_id, event_bus, tools)
         self._auditor = Auditor(self._executor.tool_names())
         self._scheduler = Scheduler()
         self._verifier = Verifier()

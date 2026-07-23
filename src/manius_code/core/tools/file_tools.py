@@ -24,6 +24,7 @@ def _workspace_label(path: Path) -> str:
 
 class WriteFileTool:
     name = "write_file"
+    arguments_model = WriteFileArguments
     definition = {
         "name": name,
         "description": "Write UTF-8 text to a file within the workspace and create missing parent directories.",
@@ -60,6 +61,7 @@ class WriteFileTool:
 
 class ListDirTool:
     name = "list_dir"
+    arguments_model = ListDirectoryArguments
     definition = {
         "name": name,
         "description": "List files and directories within the workspace with a bounded recursive depth.",
