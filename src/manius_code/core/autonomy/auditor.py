@@ -2,12 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep
+from manius_code.core.autonomy.contracts import AuditResult, AuditViolation, ActionProposal, PlanProposal, PlanStep
 from manius_code.core.tools.paths import resolve_workspace_path
-
-
-class AuditError(ValueError):
-    pass
 
 
 class Auditor:
@@ -16,70 +12,131 @@ class Auditor:
         self._allowed_tools = allowed_tools
         self._workspace = workspace.expanduser().resolve()
 
-    # 校验计划 DAG、工具声明和验收条件是否满足机器规则。
-    def approve_plan(self, proposal: PlanProposal) -> None:
+    # 返回计划的全部机器规则违规项而不抛出会终止 Agent 的异常。
+    def approve_plan(self, proposal: PlanProposal) -> AuditResult:
+        violations: list[AuditViolation] = []
         identifiers = [step.id for step in proposal.steps]
         if len(identifiers) != len(set(identifiers)):
-            raise AuditError("plan step IDs must be unique")
+            violations.append(AuditViolation(code="duplicate_step_id", message="plan step IDs must be unique"))
         known_steps = set(identifiers)
         for step in proposal.steps:
             if step.id in step.dependencies:
-                raise AuditError(f"step {step.id} cannot depend on itself")
+                violations.append(
+                    AuditViolation(code="self_dependency", message=f"step {step.id} cannot depend on itself")
+                )
             unknown_dependencies = set(step.dependencies) - known_steps
             if unknown_dependencies:
-                raise AuditError(f"step {step.id} has unknown dependencies: {sorted(unknown_dependencies)}")
+                violations.append(
+                    AuditViolation(
+                        code="unknown_dependency",
+                        message=f"step {step.id} has unknown dependencies: {sorted(unknown_dependencies)}",
+                    )
+                )
             unknown_tools = set(step.allowed_tools) - self._allowed_tools
             if unknown_tools:
-                raise AuditError(f"step {step.id} uses unavailable tools: {sorted(unknown_tools)}")
+                violations.append(
+                    AuditViolation(
+                        code="unavailable_tool",
+                        message=f"step {step.id} uses unavailable tools: {sorted(unknown_tools)}",
+                    )
+                )
             if len(step.allowed_tools) != 1:
-                raise AuditError(f"step {step.id} must allow exactly one tool")
+                violations.append(
+                    AuditViolation(code="tool_count", message=f"step {step.id} must allow exactly one tool")
+                )
             if len(step.artifacts) > 1:
-                raise AuditError(f"step {step.id} must declare at most one artifact")
+                violations.append(
+                    AuditViolation(code="artifact_count", message=f"step {step.id} must declare at most one artifact")
+                )
             if not step.acceptance_criteria:
-                raise AuditError(f"step {step.id} must declare acceptance criteria")
+                violations.append(
+                    AuditViolation(code="missing_acceptance", message=f"step {step.id} must declare acceptance criteria")
+                )
             criterion_paths = {criterion.path for criterion in step.acceptance_criteria if criterion.path is not None}
             if len(criterion_paths) > 1:
-                raise AuditError(f"step {step.id} cannot verify multiple file outputs")
+                violations.append(
+                    AuditViolation(
+                        code="multiple_output_paths",
+                        message=f"step {step.id} cannot verify multiple file outputs",
+                    )
+                )
             if step.artifacts and criterion_paths and step.artifacts[0] not in criterion_paths:
-                raise AuditError(f"step {step.id} artifact must match its acceptance path")
+                violations.append(
+                    AuditViolation(
+                        code="artifact_path_mismatch",
+                        message=f"step {step.id} artifact must match its acceptance path",
+                    )
+                )
             for criterion in step.acceptance_criteria:
-                if criterion.path is not None:
-                    try:
-                        resolve_workspace_path(criterion.path, self._workspace)
-                    except ValueError as error:
-                        raise AuditError(f"step {step.id} has an unsafe acceptance path") from error
-        self._assert_acyclic(proposal.steps)
+                if criterion.path is None:
+                    continue
+                try:
+                    resolve_workspace_path(criterion.path, self._workspace)
+                except ValueError:
+                    violations.append(
+                        AuditViolation(
+                            code="unsafe_acceptance_path",
+                            message=f"step {step.id} acceptance path is outside the workspace: {criterion.path}",
+                        )
+                    )
+        if self._has_cycle(proposal.steps):
+            violations.append(AuditViolation(code="cyclic_dependencies", message="plan dependencies must be acyclic"))
+        return self._result(violations)
 
-    # 校验动作只会作用于当前步骤允许的工具和工作区路径。
-    def approve_action(self, step: PlanStep, proposal: ActionProposal) -> None:
+    # 返回动作的机器规则违规项，使运行器能够只重试当前步骤。
+    def approve_action(self, step: PlanStep, proposal: ActionProposal) -> AuditResult:
+        violations: list[AuditViolation] = []
         if proposal.step_id != step.id:
-            raise AuditError("action step does not match the scheduled step")
+            violations.append(
+                AuditViolation(code="step_mismatch", message="action step does not match the scheduled step")
+            )
         if proposal.tool_name not in step.allowed_tools:
-            raise AuditError(f"tool {proposal.tool_name} is not allowed for step {step.id}")
+            violations.append(
+                AuditViolation(
+                    code="tool_not_allowed",
+                    message=(
+                        f"tool {proposal.tool_name!r} is not allowed for step {step.id}; "
+                        f"allowed tools: {', '.join(step.allowed_tools)}"
+                    ),
+                )
+            )
         path = proposal.arguments.get("path")
         if isinstance(path, str):
             try:
                 resolve_workspace_path(path, self._workspace)
-            except ValueError as error:
-                raise AuditError("action path must stay within the workspace") from error
+            except ValueError:
+                violations.append(
+                    AuditViolation(
+                        code="unsafe_action_path",
+                        message=f"action path is outside the workspace: {path}",
+                    )
+                )
+        return self._result(violations)
 
-    # 通过深度优先遍历拒绝任意环状依赖。
-    def _assert_acyclic(self, steps: list[PlanStep]) -> None:
+    # 将违规列表规范为可持久化、可注入模型上下文的紧凑审计结果。
+    def _result(self, violations: list[AuditViolation]) -> AuditResult:
+        return AuditResult(
+            approved=not violations,
+            summary="; ".join(violation.message for violation in violations),
+            violations=violations,
+        )
+
+    # 通过深度优先遍历判断计划依赖图是否存在环。
+    def _has_cycle(self, steps: list[PlanStep]) -> bool:
         dependencies = {step.id: step.dependencies for step in steps}
         visiting: set[str] = set()
         visited: set[str] = set()
 
-        # 深度遍历单个步骤依赖以检测回边。
-        def visit(step_id: str) -> None:
+        # 深度遍历单个步骤并在回到访问中节点时标记依赖环。
+        def visit(step_id: str) -> bool:
             if step_id in visiting:
-                raise AuditError("plan dependencies must be acyclic")
+                return True
             if step_id in visited:
-                return
+                return False
             visiting.add(step_id)
-            for dependency in dependencies[step_id]:
-                visit(dependency)
+            has_cycle = any(visit(dependency) for dependency in dependencies[step_id] if dependency in dependencies)
             visiting.remove(step_id)
             visited.add(step_id)
+            return has_cycle
 
-        for step_id in dependencies:
-            visit(step_id)
+        return any(visit(step_id) for step_id in dependencies)

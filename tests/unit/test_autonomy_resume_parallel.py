@@ -4,7 +4,7 @@ from pathlib import Path
 
 from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.autonomy.contracts import AcceptanceCriterion, ActionProposal, Plan, PlanProposal, PlanStep, ResolverDecision, StepResult
+from manius_code.core.autonomy.contracts import AuditResult, AcceptanceCriterion, ActionProposal, Plan, PlanProposal, PlanStep, ResolverDecision, StepResult
 from manius_code.core.autonomy.policy import AutonomyPolicy
 from manius_code.core.autonomy.store import PlanStore
 from manius_code.core.autonomy.supervisor import AutonomousSupervisor
@@ -22,6 +22,7 @@ class ResumableProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         raise AssertionError("resume must reuse the persisted plan")
 
@@ -55,6 +56,7 @@ class ParallelProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         return PlanProposal(
             goal=goal,

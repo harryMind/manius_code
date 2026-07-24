@@ -8,6 +8,7 @@ from manius_code.core.agent.runner import AgentRunner
 from manius_code.core.autonomy.auditor import Auditor
 from manius_code.core.autonomy.contracts import (
     AcceptanceCriterion,
+    AuditResult,
     ActionProposal,
     PlanProposal,
     PlanStep,
@@ -31,6 +32,7 @@ class ReadmeProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         self.available_tools = available_tools
         return PlanProposal(
@@ -79,6 +81,7 @@ class RetryingWriteProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         return PlanProposal(
             goal=goal,
@@ -134,6 +137,7 @@ class ReplanningProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         return PlanProposal(
             goal=goal,
@@ -198,6 +202,7 @@ class RevisingCriteriaProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         return PlanProposal(
             goal=goal,
@@ -247,6 +252,7 @@ class InvalidPlanProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
         criterion = AcceptanceCriterion(kind="tool_result_contains", expected="unused")
         return PlanProposal(
@@ -287,9 +293,124 @@ class EscapedGoalProvider(ReadmeProvider):
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
-        proposal = await super().plan(run_id, step, goal, memories, available_tools)
+        proposal = await super().plan(run_id, step, goal, memories, available_tools, audit_report)
         return proposal.model_copy(update={"goal": goal.removeprefix("请").replace("\\", "\\\\")})
+
+
+class PlanAuditRetryProvider:
+    # 保存每次规划收到的审计报告以验证只携带上一轮计划违规。
+    def __init__(self) -> None:
+        self.audit_reports: list[AuditResult | None] = []
+
+    # 首次返回违规工具并在收到审计反馈后生成可执行的替代计划。
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+        audit_report: AuditResult | None = None,
+    ) -> PlanProposal:
+        self.audit_reports.append(audit_report)
+        if audit_report is None:
+            return PlanProposal(
+                goal=goal,
+                steps=[
+                    PlanStep(
+                        id="inspect",
+                        title="Inspect README",
+                        allowed_tools=["delete_all"],
+                        acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="Main sections")],
+                    )
+                ],
+            )
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="inspect",
+                    title="Inspect README",
+                    allowed_tools=["read_file"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="Main sections")],
+                )
+            ],
+        )
+
+    # 对通过审计后的读取步骤返回受允许工具约束的动作。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        return ActionProposal(step_id=plan_step.id, tool_name="read_file", arguments={"path": "README.md"})
+
+    # 计划审计修复路径不应进入步骤失败修复器。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        raise AssertionError("plan audit retry must not call the Resolver")
+
+    # 返回计划重试与读取验收完成后的稳定摘要。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "plan audit feedback corrected the plan"
+
+
+class ActionAuditRetryProvider:
+    # 保存动作历史以验证审计违规只回馈给同一步骤的下一次动作请求。
+    def __init__(self) -> None:
+        self.action_histories: list[list[StepResult]] = []
+        self.resolver_called = False
+
+    # 提供一个固定的单步读取计划，确保动作违规不会触发全量重规划。
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+        audit_report: AuditResult | None = None,
+    ) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id="inspect",
+                    title="Inspect README",
+                    allowed_tools=["read_file"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected="Main sections")],
+                )
+            ],
+        )
+
+    # 首次故意返回未授权工具，下一次根据最新审计结果改为允许动作。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        self.action_histories.append(list(history))
+        if not history or history[-1].audit_report is None:
+            return ActionProposal(step_id=plan_step.id, tool_name="write_file", arguments={"path": "ignored.txt", "content": "x"})
+        return ActionProposal(step_id=plan_step.id, tool_name="read_file", arguments={"path": "README.md"})
+
+    # 动作审计失败必须绕过 Resolver，避免请求整计划重构。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        self.resolver_called = True
+        raise AssertionError("action audit retry must not call the Resolver")
+
+    # 返回动作修复完成后的稳定摘要。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "action audit feedback corrected the action"
 
 
 # 功能：验证运行器以五层闭环执行受审计计划、持久化计划状态和验证事件，而非旧的直接工具调用循环。
@@ -359,16 +480,18 @@ def test_auditor_allows_absolute_paths_only_inside_configured_workspace(tmp_path
     )
     auditor = Auditor({"write_file"}, tmp_path)
 
-    auditor.approve_plan(proposal)
-    auditor.approve_action(
+    assert auditor.approve_plan(proposal).approved is True
+    assert auditor.approve_action(
         proposal.steps[0],
         ActionProposal(step_id="write", tool_name="write_file", arguments={"path": str(inside), "content": "ok"}),
-    )
+    ).approved is True
     outside = tmp_path.parent / "outside.py"
     proposal.steps[0].acceptance_criteria[0].path = str(outside)
     proposal.steps[0].artifacts = [str(outside)]
-    with pytest.raises(ValueError, match="unsafe acceptance path"):
-        auditor.approve_plan(proposal)
+    rejected = auditor.approve_plan(proposal)
+
+    assert rejected.approved is False
+    assert rejected.violations[0].code == "unsafe_acceptance_path"
 
 
 # 功能：验证真实工具错误不会结束任务，而是经 Resolver 返回调度器并在下一次尝试后完成验收。
@@ -392,6 +515,60 @@ def test_agent_runner_recovers_from_tool_failure_with_a_verified_retry(tmp_path:
     assert any(event["type"] == "tool_call_failed" for event in events)
     assert attempts[0]["error"] is not None
     assert attempts[-1]["error"] is None
+
+
+# 功能：验证计划审计失败会将最新违规报告送回规划器并在下一轮生成可执行计划。
+# 设计：首次返回不存在的工具，第二次仅依赖 audit_report 改正，断言没有将多轮错误累积到 Provider。
+def test_agent_runner_replans_after_plan_audit_feedback(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    provider = PlanAuditRetryProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: provider,
+    )
+
+    summary = asyncio.run(runner.run("Inspect README"))
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "runs" / summary.run_id / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert summary.status == "success"
+    assert provider.audit_reports[0] is None
+    assert provider.audit_reports[1] is not None
+    assert [violation.code for violation in provider.audit_reports[1].violations] == ["unavailable_tool"]
+    assert [event["type"] for event in events].count("plan_proposed") == 2
+    assert [event["type"] for event in events].count("plan_approved") == 1
+
+
+# 功能：验证动作审计失败只重试当前步骤并将最新报告送入下一次动作请求。
+# 设计：首次调用未授权 write_file、第二次改为 read_file，断言 Resolver 与全量重规划均未参与且审计记录已持久化。
+def test_agent_runner_retries_current_step_after_action_audit_feedback(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# Main sections\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    provider = ActionAuditRetryProvider()
+    runner = AgentRunner(
+        ManiusConfig(max_steps=3),
+        runs_dir=tmp_path / "runs",
+        provider_factory=lambda _bus: provider,
+    )
+
+    summary = asyncio.run(runner.run("Inspect README"))
+    run_dir = tmp_path / "runs" / summary.run_id
+    events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    attempts = [json.loads(line) for line in (run_dir / "plan" / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+
+    assert summary.status == "success"
+    assert summary.total_steps == 2
+    assert provider.resolver_called is False
+    assert provider.action_histories[0] == []
+    assert provider.action_histories[1][-1].audit_report is not None
+    assert provider.action_histories[1][-1].audit_report.violations[0].code == "tool_not_allowed"
+    assert [event["type"] for event in events].count("plan_proposed") == 1
+    assert [event["type"] for event in events].count("tool_call_start") == 1
+    assert attempts[0]["audit_report"]["violations"][0]["code"] == "tool_not_allowed"
 
 
 # 功能：验证运行器会将配置工作区同时注入文件工具、验收器和任务记忆。
@@ -464,8 +641,8 @@ def test_agent_runner_reuses_observation_after_revising_acceptance_criteria(tmp_
     assert "plan_revised" in [event["type"] for event in events]
 
 
-# 功能：验证 Auditor 会拒绝循环依赖计划，且不会注册或调用旧 TaskManager 与直接工具调用路径。
-# 设计：以循环 DAG 替身验证失败汇总和零执行步，确保非法规划在进入 Executor 前被机器规则阻断。
+# 功能：验证循环依赖计划会在计划审计重试上限后失败且不会进入 Executor。
+# 设计：持续返回相同循环 DAG，断言运行器仅重试规划并将最终审计原因作为终止摘要。
 def test_agent_runner_rejects_invalid_plan_before_execution(tmp_path: Path) -> None:
     runner = AgentRunner(
         ManiusConfig(max_steps=3),
@@ -479,9 +656,10 @@ def test_agent_runner_rejects_invalid_plan_before_execution(tmp_path: Path) -> N
 
     assert summary.status == "failed"
     assert summary.total_steps == 0
+    assert "plan audit retry exhausted" in (summary.reason or "")
     assert "acyclic" in (summary.reason or "")
     assert not (run_dir / ".tasks").exists()
-    assert event_types == ["run_started", "plan_proposed", "run_finished"]
+    assert event_types == ["run_started", "plan_proposed", "plan_proposed", "plan_proposed", "run_finished"]
 
 
 # 功能：验证守护进程运行器只持久化和广播事件，不向本地标准输出泄漏规划或工具日志。

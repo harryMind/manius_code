@@ -8,7 +8,8 @@ def plan_instruction() -> str:
         "or tool_result_contains. A step must use exactly one tool and produce or verify one independently testable result. "
         "Split each source file, configuration file, or research observation into its own step. Do not create a directory-only "
         "step because write_file creates parent directories. A file-writing step must list only that file in artifacts and use "
-        "acceptance criteria for that same file."
+        "acceptance criteria for that same file. If latest_plan_audit_report is present, regenerate the complete plan by fixing "
+        "only its listed violations."
     )
 
 
@@ -25,6 +26,7 @@ def action_instruction() -> str:
     return (
         "You are the Executor planner. The response structure is enforced by the API. Propose exactly one action "
         "for the supplied step. Its tool_name must be in allowed_tools and all paths must be workspace-relative. "
+        "If latest_action_audit_report is present, correct only this action for the same step. "
         + shell_guidance
     )
 

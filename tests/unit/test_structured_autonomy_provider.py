@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from manius_code.core.autonomy.contracts import PlanProposal, PlanStep
+from manius_code.core.autonomy.contracts import AuditResult, AuditViolation, PlanProposal, PlanStep, StepResult
 from manius_code.core.autonomy.planner import StructuredAutonomyProvider
 from manius_code.core.config import ManiusConfig
 from manius_code.core.prompt import plan_instruction
@@ -79,6 +79,83 @@ def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> N
     assert "schema" not in payload
     assert request["system_instruction"] == plan_instruction()
     assert request["response_model"] is PlanProposal
+
+
+# 功能：验证计划审计失败时仅将最新的结构化违规报告传给下一次规划请求。
+# 设计：直接构造一个 AuditResult 并检查独立 payload 字段，避免把审计数据伪装成长期记忆或原始日志。
+def test_structured_autonomy_provider_includes_latest_plan_audit_report() -> None:
+    response = {
+        "goal": "Read README",
+        "steps": [
+            {
+                "id": "inspect",
+                "title": "Read README",
+                "allowed_tools": ["read_file"],
+                "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "Manius"}],
+            }
+        ],
+    }
+    audit_report = AuditResult(
+        approved=False,
+        summary="step inspect uses unavailable tools: ['delete_all']",
+        violations=[
+            AuditViolation(code="unavailable_tool", message="step inspect uses unavailable tools: ['delete_all']")
+        ],
+    )
+    llm = FakeLlmProvider(json.dumps(response))
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
+
+    asyncio.run(provider.plan("run-1", 0, "Read README", [], ["read_file"], audit_report))
+    payload = json.loads(llm.requests[0]["messages"][0]["content"])
+
+    assert payload["latest_plan_audit_report"]["violations"] == [
+        {"code": "unavailable_tool", "message": "step inspect uses unavailable tools: ['delete_all']"}
+    ]
+    assert payload["verified_memories"] == []
+
+
+# 功能：验证动作重试仅携带最近一次动作审计报告且不累积旧审计错误。
+# 设计：构造两次审计失败历史并检查 payload 只包含末次违规，普通 attempts 中不再重复嵌入审计报告。
+def test_structured_autonomy_provider_includes_only_latest_action_audit_report() -> None:
+    llm = FakeLlmProvider(
+        json.dumps(
+            {
+                "step_id": "inspect",
+                "tool_name": "read_file",
+                "arguments": {"path": "README.md"},
+            }
+        )
+    )
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
+    old_report = AuditResult(
+        approved=False,
+        violations=[AuditViolation(code="old", message="old violation")],
+    )
+    latest_report = AuditResult(
+        approved=False,
+        violations=[AuditViolation(code="tool_not_allowed", message="use read_file")],
+    )
+    history = [
+        StepResult(step_id="inspect", attempt=1, error="old violation", audit_report=old_report),
+        StepResult(step_id="inspect", attempt=2, error="use read_file", audit_report=latest_report),
+        StepResult(step_id="other", attempt=1, observation="another parallel step completed"),
+    ]
+
+    asyncio.run(
+        provider.action(
+            "run-1",
+            2,
+            PlanStep(id="inspect", title="Inspect", allowed_tools=["read_file"]),
+            history,
+        )
+    )
+    payload = json.loads(llm.requests[0]["messages"][0]["content"])
+
+    assert payload["latest_action_audit_report"]["violations"] == [
+        {"code": "tool_not_allowed", "message": "use read_file"}
+    ]
+    assert [attempt["step_id"] for attempt in payload["recent_attempts"]] == ["other"]
+    assert all(attempt["audit_report"] is None for attempt in payload["recent_attempts"])
 
 
 # 功能：验证动作规划会按当前步骤白名单生成包含具体工具参数模型的原生响应 schema。

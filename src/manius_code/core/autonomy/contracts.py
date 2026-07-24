@@ -17,6 +17,17 @@ class AcceptanceCriterion(BaseModel):
     expected: str | None = None
 
 
+class AuditViolation(BaseModel):
+    code: str
+    message: str
+
+
+class AuditResult(BaseModel):
+    approved: bool
+    summary: str = ""
+    violations: list[AuditViolation] = Field(default_factory=list)
+
+
 class PlanStep(BaseModel):
     id: str = Field(min_length=1)
     title: str = Field(min_length=1)
@@ -70,6 +81,7 @@ class StepResult(BaseModel):
     tool_name: str | None = None
     observation: str = ""
     error: str | None = None
+    audit_report: AuditResult | None = None
 
 
 class VerificationResult(BaseModel):

@@ -6,7 +6,7 @@ from typing import Mapping, Protocol, TypeVar
 
 from pydantic import BaseModel
 
-from manius_code.core.autonomy.contracts import ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
+from manius_code.core.autonomy.contracts import AuditResult, ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
 from manius_code.core.autonomy.structured_models import action_response_model
 from manius_code.core.llm.provider import LlmProvider
 from manius_code.core.prompt import action_instruction, plan_instruction, resolver_instruction, summary_instruction
@@ -23,6 +23,7 @@ class AutonomyProvider(Protocol):
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal: ...
 
     # 为已经调度的计划步骤提出一个受限工具动作。plan() → PlanProposal[PlanStepA, PlanStepB]
@@ -64,31 +65,54 @@ class StructuredAutonomyProvider:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
+        payload: dict[str, object] = {
+            "goal": goal,
+            "workspace_root": str(self._workspace),
+            "verified_memories": memories,
+            "available_tools": available_tools,
+        }
+        if audit_report is not None:
+            payload["latest_plan_audit_report"] = {
+                "violations": [violation.model_dump(mode="json") for violation in audit_report.violations],
+                "rule_reminder": "Regenerate the complete plan and correct only these listed violations.",
+            }
         return await self._request(
             run_id,
             step,
             plan_instruction(),
-            {
-                "goal": goal,
-                "workspace_root": str(self._workspace),
-                "verified_memories": memories,
-                "available_tools": available_tools,
-            },
+            payload,
             PlanProposal,
         )
 
     # 请求模型仅返回当前步骤允许的一个 ActionProposal。
     async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        latest_audit = next(
+            (
+                item.audit_report
+                for item in reversed(history)
+                if item.step_id == plan_step.id and item.audit_report is not None
+            ),
+            None,
+        )
+        payload: dict[str, object] = {
+            "plan_step": plan_step.model_dump(mode="json"),
+            "workspace_root": str(self._workspace),
+            "recent_attempts": [
+                item.model_dump(mode="json") for item in history[-6:] if item.audit_report is None
+            ],
+        }
+        if latest_audit is not None:
+            payload["latest_action_audit_report"] = {
+                "violations": [violation.model_dump(mode="json") for violation in latest_audit.violations],
+                "rule_reminder": "Correct this action for the same step using only its allowed tools and workspace paths.",
+            }
         response = await self._request(
             run_id,
             step,
             action_instruction(),
-            {
-                "plan_step": plan_step.model_dump(mode="json"),
-                "workspace_root": str(self._workspace),
-                "recent_attempts": [item.model_dump(mode="json") for item in history[-6:]],
-            },
+            payload,
             action_response_model(plan_step.id, plan_step.allowed_tools, self._tool_argument_models),
         )
         return ActionProposal.model_construct(**response.action.model_dump(mode="json"))
@@ -171,8 +195,9 @@ class Planner:
         goal: str,
         memories: list[str],
         available_tools: list[str],
+        audit_report: AuditResult | None = None,
     ) -> PlanProposal:
-        return await self._provider.plan(run_id, step, goal, memories, available_tools)
+        return await self._provider.plan(run_id, step, goal, memories, available_tools, audit_report)
 
     # 委托模型针对一个已就绪步骤提出受限动作。
     async def propose_action(

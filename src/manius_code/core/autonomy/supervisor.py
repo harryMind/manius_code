@@ -4,8 +4,8 @@ import asyncio
 from pathlib import Path
 
 from manius_code.core.agent.context import ExecutionContext
-from manius_code.core.autonomy.auditor import AuditError, Auditor
-from manius_code.core.autonomy.contracts import Plan, PlanProposal, PlanStep, StepResult
+from manius_code.core.autonomy.auditor import Auditor
+from manius_code.core.autonomy.contracts import AuditResult, Plan, PlanProposal, PlanStep, StepResult
 from manius_code.core.autonomy.executor import Executor
 from manius_code.core.autonomy.planner import AutonomyProvider, Planner
 from manius_code.core.autonomy.policy import AutonomyPolicy
@@ -56,14 +56,7 @@ class AutonomousSupervisor:
     async def run(self, plan: Plan | None = None, history: list[StepResult] | None = None) -> None:
         self._history = list(history or [])
         if plan is None:
-            proposal = await self._planner.create(
-                self._context.run_id,
-                self._context.step,
-                self._context.goal,
-                self._memory.retrieve(),
-                sorted(self._executor.tool_names()),
-            )
-            plan = await self._approve_plan(proposal, 1)
+            plan = await self._create_approved_plan(1)
         while self._context.step < self._policy.max_steps:
             ready_steps = self._scheduler.ready_steps(plan)
             self._plans.save_state(plan)
@@ -95,8 +88,29 @@ class AutonomousSupervisor:
                 break
         raise RuntimeError(f"Agent exceeded max_steps={self._policy.max_steps}")
 
-    # 将经审计的计划提案版本化并持久化为当前运行的唯一计划事实。
-    async def _approve_plan(self, proposal: PlanProposal, version: int) -> Plan:
+    # 使用最近一次计划审计报告重试生成完整计划，并在达到上限时以明确原因终止。
+    async def _create_approved_plan(self, version: int, audit_report: AuditResult | None = None) -> Plan:
+        latest_report = audit_report
+        for _ in range(self._policy.max_plan_audit_attempts):
+            proposal = await self._planner.create(
+                self._context.run_id,
+                self._context.step,
+                self._context.goal,
+                self._memory.retrieve(),
+                sorted(self._executor.tool_names()),
+                latest_report,
+            )
+            approval = await self._approve_plan(proposal, version)
+            if isinstance(approval, Plan):
+                return approval
+            latest_report = approval
+        detail = latest_report.summary if latest_report is not None else "unknown audit failure"
+        raise RuntimeError(
+            f"plan audit retry exhausted after {self._policy.max_plan_audit_attempts} attempts: {detail}"
+        )
+
+    # 审计计划并在通过时持久化，失败时返回结构化报告供下一次规划使用。
+    async def _approve_plan(self, proposal: PlanProposal, version: int) -> Plan | AuditResult:
         proposal = proposal.model_copy(update={"goal": self._context.goal})
         await self._event_bus.publish(
             PlanProposedEvent(
@@ -106,7 +120,9 @@ class AutonomousSupervisor:
                 plan=proposal.model_dump(mode="json"),
             )
         )
-        self._auditor.approve_plan(proposal)
+        audit_report = self._auditor.approve_plan(proposal)
+        if not audit_report.approved:
+            return audit_report
         plan = Plan(version=version, goal=proposal.goal, steps=proposal.steps)
         self._plans.persist(plan)
         await self._event_bus.publish(
@@ -139,9 +155,18 @@ class AutonomousSupervisor:
                 plan_step,
                 self._history,
             )
-            self._auditor.approve_action(plan_step, proposal)
-            result = await self._executor.execute(proposal, execution_step, plan_step.attempt_count)
-        except (AuditError, RuntimeError) as error:
+            audit_report = self._auditor.approve_action(plan_step, proposal)
+            if not audit_report.approved:
+                result = StepResult(
+                    step_id=plan_step.id,
+                    attempt=plan_step.attempt_count,
+                    tool_name=proposal.tool_name,
+                    error=audit_report.summary,
+                    audit_report=audit_report,
+                )
+            else:
+                result = await self._executor.execute(proposal, execution_step, plan_step.attempt_count)
+        except RuntimeError as error:
             result = StepResult(step_id=plan_step.id, attempt=plan_step.attempt_count, error=str(error))
         return plan_step, result, execution_step
 
@@ -193,6 +218,10 @@ class AutonomousSupervisor:
         if plan_step.attempt_count >= self._policy.max_attempts_per_step:
             plan_step.status = "failed"
             raise RuntimeError(f"step {plan_step.id} exceeded max_attempts={self._policy.max_attempts_per_step}: {result.error}")
+        if result.audit_report is not None:
+            plan_step.status = "retryable"
+            await self._publish_step_done(f"action audit retry scheduled: {result.audit_report.summary}", execution_step)
+            return None
         decision = await self._resolver.decide(
             self._context.run_id,
             execution_step,
@@ -244,7 +273,12 @@ class AutonomousSupervisor:
                 raise RuntimeError("resolver requested replan without a plan")
             if plan.version >= self._policy.max_plan_versions:
                 raise RuntimeError(f"plan exceeded max_versions={self._policy.max_plan_versions}")
-            replacement = await self._approve_plan(decision.plan, plan.version + 1)
+            approval = await self._approve_plan(decision.plan, plan.version + 1)
+            replacement = (
+                approval
+                if isinstance(approval, Plan)
+                else await self._create_approved_plan(plan.version + 1, approval)
+            )
             await self._event_bus.publish(
                 PlanRevisedEvent(
                     run_id=self._context.run_id,
@@ -277,7 +311,8 @@ class AutonomousSupervisor:
             goal=plan.goal,
             steps=[normalized_step if step.id == plan_step.id else step.model_copy(deep=True) for step in plan.steps],
         )
-        replacement = await self._approve_plan(proposal, plan.version + 1)
+        approval = await self._approve_plan(proposal, plan.version + 1)
+        replacement = approval if isinstance(approval, Plan) else await self._create_approved_plan(plan.version + 1, approval)
         await self._event_bus.publish(
             PlanRevisedEvent(
                 run_id=self._context.run_id,
