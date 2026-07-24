@@ -1,25 +1,56 @@
 import time
-from typing import Any, TypeVar
+from typing import Any, Callable, TypeVar
 from uuid import uuid4
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
+from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.bus.events import LlmRequestEvent, LlmResponseEvent, LlmTokenEvent
 from manius_code.core.llm.models import LlmResponse, ToolCall
+from manius_code.core.llm.structured import InstructorAdapter, InstructorRequest, InstructorStructuredOutput
 from manius_code.core.prompt import legacy_agent_instruction
 from manius_code.core.tracing import TracingProvider
 
 _StructuredModel = TypeVar("_StructuredModel", bound=BaseModel)
 
 
-class AnthropicStructuredOutputError(RuntimeError):
-    pass
+class AnthropicInstructorAdapter:
+    # 注入模型配置和可替换的 Instructor 工厂以适配 Anthropic 原生客户端。
+    def __init__(
+        self,
+        config: LlmConfig,
+        instructor_factory: Callable[[Any], Any] | None = None,
+    ) -> None:
+        self._config = config
+        self._instructor_factory = instructor_factory
+
+    # 将 Anthropic 异步客户端包装为 Instructor 异步客户端。
+    def create_client(self, client: Any) -> Any:
+        if self._instructor_factory is not None:
+            return self._instructor_factory(client)
+        import instructor
+
+        return instructor.from_anthropic(client)
+
+    # 构造 Anthropic 消息接口所需的模型、令牌数和系统指令参数。
+    def build_request(
+        self,
+        messages: list[dict[str, Any]],
+        system_instruction: str | None,
+    ) -> InstructorRequest:
+        return InstructorRequest(
+            messages=messages,
+            options={
+                "model": self._config.default_model,
+                "max_tokens": 4096,
+                "system": system_instruction or legacy_agent_instruction(),
+            },
+        )
 
 
 class AnthropicProvider:
-    # 注入 Claude 配置、事件总线和可选的异步 SDK 客户端。
+    # 注入 Claude 配置、事件总线、工具定义和可替换的 SDK 客户端。
     def __init__(
         self,
         config: LlmConfig,
@@ -27,14 +58,20 @@ class AnthropicProvider:
         tool_definitions: list[dict[str, Any]],
         client: Any | None = None,
         tracer: TracingProvider | None = None,
+        structured_adapter: InstructorAdapter | None = None,
     ) -> None:
         self._config = config
         self._event_bus = event_bus
         self._tool_definitions = tool_definitions
         self._client = client
         self._tracer = tracer
+        self._structured_output = InstructorStructuredOutput(
+            event_bus,
+            structured_adapter or AnthropicInstructorAdapter(config),
+            tracer=tracer,
+        )
 
-    # 向 Anthropic 发送上下文并将响应转换为 Agent 可处理结构。
+    # 向 Anthropic 发送流式上下文并转换为 Agent 可处理的响应结构。
     async def complete(
         self,
         run_id: str,
@@ -112,7 +149,7 @@ class AnthropicProvider:
         )
         return result
 
-    # 直接将 Pydantic 响应模型交给 Anthropic 原生 parse 接口并返回 API 约束后的结果。
+    # 委托通用 Instructor 适配层对 Anthropic 响应执行原生结构化输出。
     async def complete_structured(
         self,
         run_id: str,
@@ -121,162 +158,16 @@ class AnthropicProvider:
         response_model: type[_StructuredModel],
         system_instruction: str | None = None,
     ) -> _StructuredModel:
-        await self._event_bus.publish(LlmRequestEvent(run_id=run_id, step=step, messages=messages))
         client = self._client or self._create_client()
         self._client = client
-        started_at = time.monotonic()
-        trace_id = uuid4().hex
-        request_payload = {
-            "model": self._config.default_model,
-            "max_tokens": 4096,
-            "system": system_instruction or legacy_agent_instruction(),
-            "messages": messages,
-            "output_config": {
-                "format": {
-                    "type": "json_schema",
-                    "schema": response_model.model_json_schema(),
-                }
-            },
-        }
-        if self._tracer is not None:
-            self._tracer.emit(
-                "CORE>LLM",
-                "llm",
-                "request",
-                {
-                    "request": request_payload,
-                    "message_count": len(messages),
-                    "tool_count": 0,
-                },
-                run_id=run_id,
-                step=step,
-                trace_id=trace_id,
-            )
-        try:
-            response = await client.messages.parse(
-                model=self._config.default_model,
-                max_tokens=4096,
-                system=system_instruction or legacy_agent_instruction(),
-                messages=messages,
-                output_format=response_model,
-            )
-            parsed_output = self._validate_structured_output(response_model, response.parsed_output)
-        except (ValidationError, AnthropicStructuredOutputError):
-            response, parsed_output = await self._complete_with_schema_tool(
-                client,
-                messages,
-                response_model,
-                system_instruction or legacy_agent_instruction(),
-                run_id,
-                step,
-                trace_id,
-            )
-        if self._tracer is not None:
-            response_payload = self._response_payload(response)
-            self._tracer.emit(
-                "LLM>CORE",
-                "llm",
-                "response",
-                {
-                    "response": response_payload,
-                    "usage": response_payload.get("usage", {}),
-                    "content_block_count": len(response_payload.get("content", [])),
-                },
-                run_id=run_id,
-                step=step,
-                trace_id=trace_id,
-            )
-        text = "\n".join(block.text for block in response.content if block.type == "text")
-        await self._event_bus.publish(
-            LlmResponseEvent(
-                run_id=run_id,
-                step=step,
-                duration_ms=round((time.monotonic() - started_at) * 1000),
-                text=text,
-                tool_calls=[],
-            )
+        return await self._structured_output.complete(
+            run_id,
+            step,
+            client,
+            messages,
+            response_model,
+            system_instruction,
         )
-        return parsed_output
-
-    # 在兼容端点忽略 output_config 时，以强制单一工具调用继续取得受 Schema 约束的结果。
-    async def _complete_with_schema_tool(
-        self,
-        client: Any,
-        messages: list[dict[str, Any]],
-        response_model: type[_StructuredModel],
-        system_instruction: str,
-        run_id: str,
-        step: int,
-        trace_id: str,
-    ) -> tuple[Any, _StructuredModel]:
-        tool_name = "emit_structured_result"
-        last_error = "required schema tool was not called"
-        for attempt in range(2):
-            request_messages = list(messages)
-            if attempt:
-                request_messages.append(
-                    {
-                        "role": "user",
-                        "content": f"The previous structured tool arguments failed validation: {last_error}. Correct every field and call the required tool again.",
-                    }
-                )
-            request_payload = {
-                "model": self._config.default_model,
-                "max_tokens": 4096,
-                "system": system_instruction,
-                "messages": request_messages,
-                "tools": [
-                    {
-                        "name": tool_name,
-                        "description": "Return the requested structured result.",
-                        "input_schema": response_model.model_json_schema(),
-                    }
-                ],
-                "tool_choice": {"type": "tool", "name": tool_name},
-            }
-            if self._tracer is not None:
-                self._tracer.emit(
-                    "CORE>LLM",
-                    "llm",
-                    "request",
-                    {
-                        "request": request_payload,
-                        "fallback_for": "output_config",
-                        "fallback_attempt": attempt + 1,
-                        "message_count": len(request_messages),
-                        "tool_count": 1,
-                    },
-                    run_id=run_id,
-                    step=step,
-                    trace_id=trace_id,
-                )
-            response = await client.messages.create(**request_payload)
-            for block in response.content:
-                if block.type != "tool_use" or block.name != tool_name:
-                    continue
-                try:
-                    return response, self._validate_structured_output(response_model, block.input)
-                except AnthropicStructuredOutputError as error:
-                    last_error = str(error)
-                    break
-            else:
-                last_error = "required schema tool was not called"
-        raise RuntimeError(f"LLM returned invalid {response_model.__name__} schema-tool arguments: {last_error}")
-
-    # 在 Anthropic Provider 内统一执行响应模型校验，避免业务层了解厂商返回的原始载荷。
-    def _validate_structured_output(
-        self,
-        response_model: type[_StructuredModel],
-        payload: Any,
-    ) -> _StructuredModel:
-        if isinstance(payload, response_model):
-            return payload
-        try:
-            return response_model.model_validate(payload)
-        except ValidationError as error:
-            raise AnthropicStructuredOutputError(
-                f"invalid {response_model.__name__} structured output: {error}"
-            ) from error
 
     # 根据配置惰性创建 Anthropic 异步客户端。
     def _create_client(self) -> Any:
@@ -290,7 +181,7 @@ class AnthropicProvider:
             default_headers={"Authorization": f"Bearer {self._config.api_key}"},
         )
 
-    # 将 SDK 的最终消息完整转换为可写入 JSON 追踪文件的字典。
+    # 将 SDK 最终消息规范化为可写入 JSON 追踪文件的字典。
     def _response_payload(self, response: Any) -> dict[str, Any]:
         if isinstance(response, BaseModel):
             return response.model_dump(mode="json")

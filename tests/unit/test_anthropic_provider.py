@@ -3,14 +3,16 @@ from collections.abc import AsyncIterator
 from io import StringIO
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 
 from manius_code.core.autonomy.contracts import PlanProposal
+from manius_code.core.bus.events import AgentEvent, LlmTokenEvent
 from manius_code.core.config import LlmConfig
 from manius_code.core.events.bus import EventBus
-from manius_code.core.bus.events import AgentEvent, LlmTokenEvent
 from manius_code.core.events.subscribers import StdoutPrinter
 from manius_code.core.llm.anthropic import AnthropicProvider
+from manius_code.core.llm.structured import InstructorRequest
 from manius_code.core.prompt import legacy_agent_instruction
 
 
@@ -26,12 +28,8 @@ class FakeResponse(BaseModel):
     content: list[FakeBlock]
 
 
-class FakeParsedResponse(FakeResponse):
-    parsed_output: Any = None
-
-
 class FakeStream:
-    # 模拟 SDK 流式上下文管理器并依次提供文本片段。
+    # 保存最终响应并提供与 Anthropic SDK 一致的异步流接口。
     def __init__(self, response: FakeResponse) -> None:
         self._response = response
         self.text_stream = self._tokens()
@@ -44,7 +42,7 @@ class FakeStream:
     async def __aexit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         return None
 
-    # 逐段生成模型文本以模拟 token 到达。
+    # 逐段产生模型文本以模拟 token 到达。
     async def _tokens(self) -> AsyncIterator[str]:
         yield "I will "
         yield "read the file."
@@ -55,14 +53,9 @@ class FakeStream:
 
 
 class FakeMessages:
-    # 保存请求参数并返回确定性的 Claude 内容块。
+    # 保存流式请求并返回确定性的 Claude 内容块。
     def __init__(self) -> None:
         self.request: dict[str, Any] | None = None
-        self.structured_request: dict[str, Any] | None = None
-        self.schema_tool_request: dict[str, Any] | None = None
-        self.invalid_structured_output = False
-        self.invalid_schema_tool_arguments = False
-        self.schema_tool_attempts = 0
 
     # 模拟 Anthropic messages.stream 并保存请求参数。
     def stream(self, **kwargs: Any) -> FakeStream:
@@ -76,69 +69,69 @@ class FakeMessages:
             )
         )
 
-    # 模拟 SDK parse 接口接收 Pydantic 模型并返回已校验的 parsed_output。
-    async def parse(self, **kwargs: Any) -> FakeParsedResponse:
-        self.structured_request = kwargs
-        response_model = kwargs["output_format"]
-        if self.invalid_structured_output:
-            return FakeParsedResponse(
-                content=[FakeBlock(type="text", text='{"steps":[]}')],
-                parsed_output={"steps": []},
-            )
-        return FakeParsedResponse(
-            content=[FakeBlock(type="text", text='{"goal":"Structured"}')],
-            parsed_output=response_model.model_validate(
-                {
-                    "goal": "Structured",
-                    "steps": [
-                        {
-                            "id": "inspect",
-                            "title": "Inspect",
-                            "allowed_tools": ["read_file"],
-                            "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "ok"}],
-                        }
-                    ],
-                }
-            ),
-        )
-
-    # 模拟兼容端点使用受强制 tool_choice 约束的工具输入返回结构化结果。
-    async def create(self, **kwargs: Any) -> FakeResponse:
-        self.schema_tool_request = kwargs
-        self.schema_tool_attempts += 1
-        acceptance_criteria = [] if self.invalid_schema_tool_arguments and self.schema_tool_attempts == 1 else [
-            {"kind": "tool_result_contains", "expected": "ok"}
-        ]
-        return FakeResponse(
-            content=[
-                FakeBlock(
-                    type="tool_use",
-                    id="structured-tool-1",
-                    name="emit_structured_result",
-                    input={
-                        "goal": "Structured fallback",
-                        "steps": [
-                            {
-                                "id": "inspect",
-                                "title": "Inspect",
-                                "allowed_tools": ["read_file"],
-                                "acceptance_criteria": acceptance_criteria,
-                            }
-                        ],
-                    },
-                )
-            ]
-        )
-
 
 class FakeClient:
-    # 暴露与 Anthropic 异步客户端相同的 messages 接口。
+    # 暴露 Anthropic 异步客户端所需的 messages 接口。
     def __init__(self) -> None:
         self.messages = FakeMessages()
 
 
-# 功能：验证 AnthropicProvider 发出 LLM 事件并解析工具调用。
-# 设计：注入最小 SDK 替身，验证请求内容、工具块转换和显式调用耗时，不访问外部模型服务。
+class FakeInstructorClient:
+    # 注入可选响应载荷以验证 Instructor 调用和最终 Pydantic 校验。
+    def __init__(self, response_payload: Any | None = None) -> None:
+        self._response_payload = response_payload
+        self.request: dict[str, Any] | None = None
+
+    # 记录 Instructor 结构化请求并返回约定的模型载荷。
+    async def create(self, **kwargs: Any) -> Any:
+        self.request = kwargs
+        if self._response_payload is not None:
+            return self._response_payload
+        response_model = kwargs["response_model"]
+        return response_model.model_validate(
+            {
+                "goal": "Structured",
+                "steps": [
+                    {
+                        "id": "inspect",
+                        "title": "Inspect",
+                        "allowed_tools": ["read_file"],
+                        "acceptance_criteria": [{"kind": "tool_result_contains", "expected": "ok"}],
+                    }
+                ],
+            }
+        )
+
+
+class FakeInstructorAdapter:
+    # 持有确定性 Instructor 客户端并统计原生客户端包装次数。
+    def __init__(self, instructor_client: FakeInstructorClient) -> None:
+        self._instructor_client = instructor_client
+        self.raw_clients: list[Any] = []
+
+    # 返回预置 Instructor 客户端以避免测试访问真实 SDK。
+    def create_client(self, client: Any) -> FakeInstructorClient:
+        self.raw_clients.append(client)
+        return self._instructor_client
+
+    # 映射 Anthropic 请求字段以验证通用层不关心厂商 SDK。
+    def build_request(
+        self,
+        messages: list[dict[str, Any]],
+        system_instruction: str | None,
+    ) -> InstructorRequest:
+        return InstructorRequest(
+            messages=messages,
+            options={
+                "model": "test-model",
+                "max_tokens": 4096,
+                "system": system_instruction or legacy_agent_instruction(),
+            },
+        )
+
+
+# 功能：验证 AnthropicProvider 发送流式事件并解析工具调用。
+# 设计：注入最小 SDK 替身，覆盖文本流、工具块转换和事件顺序而不访问外部模型服务。
 def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
     events: list[AgentEvent] = []
     event_bus = EventBus()
@@ -150,7 +143,9 @@ def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
         [{"name": "read_file", "input_schema": {"type": "object"}}],
         client=client,
     )
+
     response = asyncio.run(provider.complete("run-1", 1, [{"role": "user", "content": "Read README.md"}]))
+
     assert client.messages.request["model"] == "test-model"
     assert client.messages.request["system"] == legacy_agent_instruction()
     assert response.tool_calls[0].name == "read_file"
@@ -160,14 +155,22 @@ def test_anthropic_provider_emits_timed_response_and_tool_call() -> None:
     assert events[-1].duration_ms >= 0
 
 
-# 功能：验证 AnthropicProvider 将 Pydantic 模型直接传给原生 messages.parse 并返回 parsed_output。
-# 设计：以 SDK 替身检查 output_format 参数对象身份，同时断言结构化路径不产生逐 token 事件或文本 JSON 解析依赖。
-def test_anthropic_provider_uses_native_pydantic_structured_output() -> None:
+# 功能：验证结构化请求由 Instructor 统一接收 Pydantic 响应模型和严格重试参数。
+# 设计：用独立 Instructor 替身断言通用层调用 create，避免测试依赖 Anthropic SDK 的 parse 或工具回退细节。
+def test_anthropic_provider_delegates_structured_output_to_instructor() -> None:
     events: list[AgentEvent] = []
     event_bus = EventBus()
     event_bus.subscribe(events.append)
     client = FakeClient()
-    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
+    instructor_client = FakeInstructorClient()
+    adapter = FakeInstructorAdapter(instructor_client)
+    provider = AnthropicProvider(
+        LlmConfig(api_key="test-key", default_model="test-model"),
+        event_bus,
+        [],
+        client=client,
+        structured_adapter=adapter,
+    )
 
     plan = asyncio.run(
         provider.complete_structured(
@@ -180,56 +183,56 @@ def test_anthropic_provider_uses_native_pydantic_structured_output() -> None:
     )
 
     assert plan.goal == "Structured"
-    assert client.messages.structured_request["output_format"] is PlanProposal
-    assert client.messages.structured_request["system"] == "Return a plan"
+    assert adapter.raw_clients == [client]
+    assert instructor_client.request["response_model"] is PlanProposal
+    assert instructor_client.request["max_retries"] == 2
+    assert instructor_client.request["strict"] is True
+    assert instructor_client.request["model"] == "test-model"
+    assert instructor_client.request["system"] == "Return a plan"
     assert [event.type for event in events] == ["llm_request", "llm_response"]
 
 
-# 功能：验证兼容端点返回不符合 output_config 的内容时会改用强制 Schema 工具调用恢复规划结果。
-# 设计：让 SDK 替身返回无效 parsed_output，再断言二次请求固定 tool_choice 且结果仍经 PlanProposal 校验，不依赖真实供应商行为。
-def test_anthropic_provider_falls_back_to_forced_schema_tool_for_invalid_native_output() -> None:
+# 功能：验证 Instructor 返回不符合 Pydantic Schema 的载荷时不会进入自主规划层。
+# 设计：替身绕过 Instructor 内部重试直接返回缺失字段的字典，覆盖通用层最后一道模型校验边界。
+def test_anthropic_provider_rejects_invalid_instructor_structured_output() -> None:
     event_bus = EventBus()
-    client = FakeClient()
-    client.messages.invalid_structured_output = True
-    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
-
-    plan = asyncio.run(
-        provider.complete_structured(
-            "run-structured",
-            2,
-            [{"role": "user", "content": "Create a plan"}],
-            PlanProposal,
-            system_instruction="Return a plan",
-        )
+    provider = AnthropicProvider(
+        LlmConfig(api_key="test-key", default_model="test-model"),
+        event_bus,
+        [],
+        client=FakeClient(),
+        structured_adapter=FakeInstructorAdapter(FakeInstructorClient({"steps": []})),
     )
 
-    assert plan.goal == "Structured fallback"
-    assert client.messages.schema_tool_request["tool_choice"] == {"type": "tool", "name": "emit_structured_result"}
-    assert client.messages.schema_tool_request["tools"][0]["input_schema"] == PlanProposal.model_json_schema()
+    with pytest.raises(RuntimeError, match="Instructor returned invalid PlanProposal structured output"):
+        asyncio.run(
+            provider.complete_structured(
+                "run-structured",
+                2,
+                [{"role": "user", "content": "Create a plan"}],
+                PlanProposal,
+            )
+        )
 
 
-# 功能：验证强制 Schema 工具首次漏填计划验收条件时会带着校验错误重试并返回可执行计划。
-# 设计：让替身的第一次工具参数为空列表、第二次合法，覆盖真实兼容端点忽略 minItems 后的自动修正边界。
-def test_anthropic_provider_retries_invalid_schema_tool_arguments() -> None:
+# 功能：验证同一 Anthropic 原生客户端只会创建一次 Instructor 包装客户端。
+# 设计：连续发起两次结构化请求，断言适配器工厂只调用一次以避免重复补丁和连接状态污染。
+def test_anthropic_provider_reuses_instructor_client_for_same_raw_client() -> None:
     event_bus = EventBus()
     client = FakeClient()
-    client.messages.invalid_structured_output = True
-    client.messages.invalid_schema_tool_arguments = True
-    provider = AnthropicProvider(LlmConfig(api_key="test-key", default_model="test-model"), event_bus, [], client=client)
-
-    plan = asyncio.run(
-        provider.complete_structured(
-            "run-structured",
-            2,
-            [{"role": "user", "content": "Create a plan"}],
-            PlanProposal,
-            system_instruction="Return a plan",
-        )
+    adapter = FakeInstructorAdapter(FakeInstructorClient())
+    provider = AnthropicProvider(
+        LlmConfig(api_key="test-key", default_model="test-model"),
+        event_bus,
+        [],
+        client=client,
+        structured_adapter=adapter,
     )
 
-    assert plan.steps[0].acceptance_criteria[0].expected == "ok"
-    assert client.messages.schema_tool_attempts == 2
-    assert len(client.messages.schema_tool_request["messages"]) == 2
+    asyncio.run(provider.complete_structured("run-1", 1, [{"role": "user", "content": "Plan"}], PlanProposal))
+    asyncio.run(provider.complete_structured("run-2", 1, [{"role": "user", "content": "Plan"}], PlanProposal))
+
+    assert adapter.raw_clients == [client]
 
 
 # 功能：验证终端订阅器收到 token 事件后立即原样输出且不追加换行。
