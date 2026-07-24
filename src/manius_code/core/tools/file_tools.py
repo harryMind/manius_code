@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,12 @@ class ListDirectoryArguments(BaseModel):
 # 将已校验的工作区路径转换为稳定的相对显示名称。
 def _workspace_label(path: Path, workspace: Path) -> str:
     return path.relative_to(workspace).as_posix() or "."
+
+
+# 在线程池中创建父目录并写入 UTF-8 文件，避免阻塞事件循环。
+def _write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
 
 class WriteFileTool:
@@ -52,8 +59,7 @@ class WriteFileTool:
         except ValueError as error:
             raise ToolExecutionError(self.name, str(error)) from error
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(values.content, encoding="utf-8")
+            await asyncio.to_thread(_write_text, path, values.content)
             return f"wrote {len(values.content)} characters to {_workspace_label(path, self._workspace)}"
         except IsADirectoryError as error:
             raise ToolExecutionError(self.name, f"path is a directory, not a file: {path}") from error
@@ -96,7 +102,7 @@ class ListDirTool:
         if not path.is_dir():
             raise ToolExecutionError(self.name, f"path is not a directory: {path}")
         try:
-            entries = self._collect(path, values.max_depth)
+            entries = await asyncio.to_thread(self._collect, path, values.max_depth)
             header = f"{_workspace_label(path, self._workspace)}/"
             return "\n".join([header, *entries]) if entries else f"{header}\n(empty)"
         except PermissionError as error:

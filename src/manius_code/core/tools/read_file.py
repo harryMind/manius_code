@@ -1,3 +1,4 @@
+import asyncio
 import codecs
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,12 @@ _MAX_READ_BYTES = 512 * 1024
 
 class ReadFileArguments(BaseModel):
     path: str
+
+
+# 在线程池中读取有上限的二进制内容，保留调用方的解码和截断策略。
+def _read_limited(path: Path) -> bytes:
+    with path.open("rb") as file:
+        return file.read(_MAX_READ_BYTES + 1)
 
 
 class ReadFileTool:
@@ -40,8 +47,7 @@ class ReadFileTool:
         except ValueError as error:
             raise ToolExecutionError(self.name, str(error)) from error
         try:
-            with path.open("rb") as file:
-                content = file.read(_MAX_READ_BYTES + 1)
+            content = await asyncio.to_thread(_read_limited, path)
             truncated = len(content) > _MAX_READ_BYTES
             decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
             text = decoder.decode(content[:_MAX_READ_BYTES], final=not truncated)

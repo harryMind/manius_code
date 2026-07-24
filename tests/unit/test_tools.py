@@ -1,6 +1,8 @@
 import asyncio
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -87,3 +89,39 @@ def test_execution_tools_use_injected_workspace_and_native_shell(tmp_path: Path,
     else:
         assert shell[:2] == ("/bin/sh", "-lc")
         assert "POSIX shell" in bash_tool.definition["description"]
+
+
+# 功能：验证 write_file 的阻塞磁盘写入不会占用 asyncio 事件循环。
+# 设计：将 Path.write_text 替换为受线程事件控制的慢操作，并以事件循环恢复延迟区分线程卸载和同步阻塞。
+def test_write_file_offloads_blocking_io_from_event_loop(tmp_path: Path, monkeypatch) -> None:
+    write_tool = WriteFileTool(tmp_path)
+    original_write_text = Path.write_text
+    started = threading.Event()
+    release = threading.Event()
+
+    # 模拟等待磁盘完成的同步写入操作。
+    def blocking_write_text(path: Path, *args: object, **kwargs: object) -> int:
+        started.set()
+        release.wait(timeout=0.2)
+        return original_write_text(path, *args, **kwargs)
+
+    # 在主事件循环中调度写入并测量控制权是否能及时返回。
+    async def write_and_measure() -> tuple[float, str]:
+        timer = threading.Timer(0.2, release.set)
+        timer.start()
+        try:
+            started_at = time.monotonic()
+            write_task = asyncio.create_task(write_tool.execute({"path": "slow.txt", "content": "done"}))
+            await asyncio.to_thread(started.wait, 0.5)
+            elapsed = time.monotonic() - started_at
+            release.set()
+            return elapsed, await write_task
+        finally:
+            release.set()
+            timer.cancel()
+
+    monkeypatch.setattr(Path, "write_text", blocking_write_text)
+    elapsed, result = asyncio.run(write_and_measure())
+
+    assert elapsed < 0.1
+    assert result == "wrote 4 characters to slow.txt"
