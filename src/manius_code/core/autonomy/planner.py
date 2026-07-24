@@ -75,6 +75,7 @@ class StructuredAutonomyProvider:
         self._provider = provider
         self._tool_argument_models = tool_argument_models
         self._workspace = (workspace or Path.cwd()).expanduser().resolve()
+        self._batch_actions_enabled = True
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
     async def plan(
@@ -138,6 +139,25 @@ class StructuredAutonomyProvider:
 
     # 使用原生结构化输出一次生成当前滚动批次每个步骤对应的受限动作。
     async def actions(
+        self,
+        run_id: str,
+        step: int,
+        plan_steps: list[PlanStep],
+        history: list[StepResult],
+    ) -> list[ActionProposal]:
+        if self._batch_actions_enabled:
+            try:
+                return await self._request_batch_actions(run_id, step, plan_steps, history)
+            except RuntimeError:
+                self._batch_actions_enabled = False
+        return list(
+            await asyncio.gather(
+                *(self.action(run_id, step, plan_step, history) for plan_step in plan_steps)
+            )
+        )
+
+    # 请求模型使用批量结构化响应一次返回当前滚动批次的所有动作。
+    async def _request_batch_actions(
         self,
         run_id: str,
         step: int,

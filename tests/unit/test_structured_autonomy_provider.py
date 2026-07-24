@@ -52,6 +52,47 @@ class FakeLlmProvider:
         return response_model.model_validate(payload)
 
 
+class BatchIncompatibleLlmProvider(FakeLlmProvider):
+    # 记录批量结构化请求并模拟兼容端点拒绝复杂批量 Schema 的行为。
+    def __init__(self) -> None:
+        super().__init__("")
+        self.batch_requests = 0
+        self.single_requests = 0
+
+    # 对批量响应抛出结构化调用错误，对单动作响应返回可验证的受限动作。
+    async def complete_structured(
+        self,
+        run_id: str,
+        step: int,
+        messages: list[dict[str, Any]],
+        response_model: type[BaseModel],
+        system_instruction: str | None = None,
+    ) -> BaseModel:
+        self.requests.append(
+            {
+                "run_id": run_id,
+                "step": step,
+                "messages": messages,
+                "system_instruction": system_instruction,
+                "response_model": response_model,
+            }
+        )
+        if "actions" in response_model.model_fields:
+            self.batch_requests += 1
+            raise RuntimeError("required schema tool was not called")
+        self.single_requests += 1
+        payload = json.loads(messages[0]["content"])
+        return response_model.model_validate(
+            {
+                "action": {
+                    "step_id": payload["plan_step"]["id"],
+                    "tool_name": "read_file",
+                    "arguments": {"path": "README.md"},
+                }
+            }
+        )
+
+
 # 功能：验证 StructuredAutonomyProvider 只依赖 LlmProvider 契约即可构造并校验规划结果。
 # 设计：使用不导入 Anthropic SDK 的结构替身，检查动态工具清单和结构化请求参数均经通用接口传递。
 def test_structured_autonomy_provider_accepts_vendor_neutral_llm_provider() -> None:
@@ -221,6 +262,25 @@ def test_structured_autonomy_provider_uses_one_structured_request_for_a_rolling_
     assert [step["id"] for step in payload["plan_steps"]] == ["first", "second"]
     assert request["system_instruction"] == batch_action_instruction()
     assert request["response_model"].model_fields["actions"].annotation
+
+
+# 功能：验证兼容端点拒绝批量结构化 Schema 时会自动降级为同批步骤的单动作结构化调用。
+# 设计：首个批量请求固定抛出真实日志中的 schema-tool 错误，再断言后续请求只使用已验证的单动作 Schema。
+def test_structured_autonomy_provider_falls_back_to_single_actions_for_batch_schema_incompatibility() -> None:
+    llm = BatchIncompatibleLlmProvider()
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
+    plan_steps = [
+        PlanStep(id="first", title="First", allowed_tools=["read_file"]),
+        PlanStep(id="second", title="Second", allowed_tools=["read_file"]),
+    ]
+
+    actions = asyncio.run(provider.actions("run-1", 1, plan_steps, []))
+    repeated_actions = asyncio.run(provider.actions("run-1", 2, plan_steps, []))
+
+    assert [action.step_id for action in actions] == ["first", "second"]
+    assert [action.step_id for action in repeated_actions] == ["first", "second"]
+    assert llm.batch_requests == 1
+    assert llm.single_requests == 4
 
 
 # 功能：验证规划响应 Schema 将每步工具和验收列表声明为 API 可见的非空数组。
