@@ -8,13 +8,18 @@ from typing import Any
 from uuid import uuid4
 
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.bus.commands import AgentResumeCommand, AgentRunCommand, AgentRunResult, EventListCommand, EventListResult, EventSubscribeCommand, EventSubscribeResult, EventUnsubscribeCommand, EventUnsubscribeResult, PingCommand, PongResult
+from manius_code.core.bus.commands import AgentResumeCommand, AgentRunCommand, AgentRunResult, EventListCommand, EventListResult, EventSubscribeCommand, EventSubscribeResult, EventUnsubscribeCommand, EventUnsubscribeResult, PingCommand, PongResult, SessionCreateCommand, SessionCreateResult, SessionDestroyCommand, SessionDestroyResult, SessionGetCommand, SessionGetResult, SessionListCommand, SessionListResult, SessionMetaResult, SessionSendCommand, SessionSendResult, SessionThreadEntryResult
 from manius_code.core.bus.events import RunFinishedEvent, RunStartedEvent
 from manius_code.core.config import ManiusConfig, load_config
 from manius_code.core.events.bus import EventBus
 from manius_code.core.events.ipc import IpcEventBroadcaster
 from manius_code.core.events.subscribers import EventWriter
 from manius_code.core.logging import setup_logging
+from manius_code.core.sessions.manager import SessionManager
+from manius_code.core.sessions.models import SessionRunRequest
+from manius_code.core.sessions.store import SessionStore
+from manius_code.core.tools.defaults import default_tool_catalog
+from manius_code.core.tools.note import NoteSaveTool
 from manius_code.core.transport.socket_server import SocketServer
 from manius_code.core.tracing import TracingProvider
 
@@ -32,6 +37,7 @@ class CoreApp:
         self._active_run_ids: set[str] = set()
         self._runs_dir = Path("runs")
         self._tracer: TracingProvider | None = None
+        self._session_manager: SessionManager | None = None
 
     # 处理 ping 命令并返回 daemon 版本和已运行时间。
     async def _ping_handler(self, params: dict[str, Any]) -> PongResult:
@@ -96,6 +102,67 @@ class CoreApp:
         task = asyncio.create_task(runner.resume(command.run_id))
         self._track_agent_task(command.run_id, task)
         return AgentRunResult(run_id=command.run_id)
+
+    # 创建新会话并返回可供客户端后续持续交互使用的持久化元数据。
+    async def _session_create_handler(self, params: dict[str, Any]) -> SessionCreateResult:
+        command = SessionCreateCommand.model_validate(params)
+        meta = await self._require_session_manager().create_session(command.client_id)
+        return SessionCreateResult(session=SessionMetaResult.model_validate(meta.model_dump()))
+
+    # 向指定会话提交一轮用户目标并立即返回后台 Agent 运行标识。
+    async def _session_send_handler(self, params: dict[str, Any]) -> SessionSendResult:
+        command = SessionSendCommand.model_validate(params)
+        run_id = await self._require_session_manager().send_message(command.session_id, command.content)
+        return SessionSendResult(session_id=command.session_id, run_id=run_id)
+
+    # 返回会话元数据及其已沉淀的短期对话摘要，供客户端恢复交互界面。
+    async def _session_get_handler(self, params: dict[str, Any]) -> SessionGetResult:
+        command = SessionGetCommand.model_validate(params)
+        meta, thread = await self._require_session_manager().get_session(command.session_id)
+        return SessionGetResult(
+            session=SessionMetaResult.model_validate(meta.model_dump()),
+            thread=[SessionThreadEntryResult.model_validate(entry.model_dump()) for entry in thread],
+        )
+
+    # 列出 daemon 已持久化的所有会话，并保持会话管理器的最近活跃排序。
+    async def _session_list_handler(self, params: dict[str, Any]) -> SessionListResult:
+        SessionListCommand.model_validate(params)
+        sessions = await self._require_session_manager().list_sessions()
+        return SessionListResult(sessions=[SessionMetaResult.model_validate(meta.model_dump()) for meta in sessions])
+
+    # 释放指定会话的进程内状态但不删除其磁盘历史，支持后续跨连接恢复。
+    async def _session_destroy_handler(self, params: dict[str, Any]) -> SessionDestroyResult:
+        command = SessionDestroyCommand.model_validate(params)
+        destroyed = await self._require_session_manager().destroy_session(command.session_id)
+        return SessionDestroyResult(session_id=command.session_id, destroyed=destroyed)
+
+    # 为会话运行器绑定上下文和 note_save 工具，复用独立任务的 AgentRunner 及事件出口。
+    def _make_session_runner(self, request: SessionRunRequest) -> AgentRunner:
+        if self._config is None:
+            raise RuntimeError("CoreApp configuration is not initialized")
+        manager = self._require_session_manager()
+
+        # 将当前运行标识封装进笔记回调，避免工具层了解会话或运行生命周期。
+        async def save_note(title: str, content: str, tags: list[str]):
+            return await manager.save_note(request.session_id, title, content, tags, request.run_id)
+
+        # 在新的目录实例上附加会话工具，确保普通独立运行不会意外获得会话能力。
+        def session_tools(config: ManiusConfig):
+            return default_tool_catalog(config).with_tool(NoteSaveTool(save_note))
+
+        return AgentRunner(
+            self._config,
+            tool_factory=session_tools,
+            event_subscribers=[self._event_broadcaster.handle],
+            tracer=self._tracer,
+            system_context=request.system_context,
+        )
+
+    # 返回已在 daemon 生命周期中初始化的会话管理器，防止处理器在启动前被错误调用。
+    def _require_session_manager(self) -> SessionManager:
+        if self._session_manager is None:
+            raise RuntimeError("SessionManager is not initialized")
+        return self._session_manager
 
     # 为参数校验失败的远程任务持久化并广播完整的失败事件闭环。
     async def _publish_failed_run(self, run_id: str, reason: str) -> None:
@@ -163,6 +230,15 @@ class CoreApp:
             else:
                 self._tracer = tracer
         self._event_broadcaster = IpcEventBroadcaster(self._tracer)
+        self._session_manager = SessionManager(
+            SessionStore(config.session.directory),
+            self._make_session_runner,
+            self._event_broadcaster.handle,
+            thread_turn_limit=config.session.thread_turn_limit,
+            notes_top_k=config.session.notes_top_k,
+            tracer=self._tracer,
+            task_observer=self._track_agent_task,
+        )
         server = SocketServer(config.host, config.port, tracer=self._tracer)
         # 注册handler以及需要tcp连接的handler
         server.register("core.ping", self._ping_handler)
@@ -171,6 +247,11 @@ class CoreApp:
         server.register("event.list", self._event_list_handler)
         server.register("agent.run", self._agent_run_handler)
         server.register("agent.resume", self._agent_resume_handler)
+        server.register("session.create", self._session_create_handler)
+        server.register("session.send", self._session_send_handler)
+        server.register("session.get", self._session_get_handler)
+        server.register("session.list", self._session_list_handler)
+        server.register("session.destroy", self._session_destroy_handler)
         server.add_disconnect_handler(self._event_broadcaster.unsubscribe_writer)
 
         try:
@@ -184,6 +265,8 @@ class CoreApp:
                     pass
             await stopped.wait()
         finally:
+            if self._session_manager is not None:
+                await self._session_manager.stop()
             await self._stop_agent_tasks()
             await server.stop()
             if self._tracer is not None:

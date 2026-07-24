@@ -154,9 +154,10 @@ class SocketServer:
         if self._tracer is None:
             return
         if isinstance(raw_request, dict):
+            method = raw_request.get("method")
             self._tracer.emit(
                 "CLIENT->CORE",
-                "ipc",
+                "session" if isinstance(method, str) and method.startswith("session.") else "ipc",
                 "request",
                 raw_request,
                 client_id=client_id,
@@ -189,9 +190,12 @@ class SocketServer:
         payload = response.model_dump(mode="json")
         result = payload.get("result")
         run_id = result.get("run_id") if isinstance(result, dict) else None
+        is_session_response = isinstance(result, dict) and (
+            "session_id" in result or "session" in result or "sessions" in result
+        )
         self._tracer.emit(
             "CORE>CLIENT",
-            "ipc",
+            "session" if is_session_response else "ipc",
             "response",
             payload,
             run_id=run_id if isinstance(run_id, str) else None,

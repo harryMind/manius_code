@@ -15,7 +15,7 @@ TraceDirection = Literal[
     "CORE>LLM",
     "LLM>CORE",
 ]
-TraceLayer = Literal["ipc", "event", "llm"]
+TraceLayer = Literal["ipc", "event", "llm", "session"]
 
 logger = logging.getLogger(__name__)
 _INDEX_VERSION = 1

@@ -23,8 +23,9 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     parser.add_argument("--goal", required=True, help="Task goal for the Agent")
     parser.set_defaults(handler=run)
     resume_parser = subparsers.add_parser("resume", help="Resume a stopped Agent task in the foreground")
-    resume_parser.add_argument("--run-id", required=True, help="Stopped Agent run identifier")
-    resume_parser.set_defaults(handler=resume)
+    resume_parser.add_argument("session_id", nargs="?", help="Persistent chat session identifier to resume")
+    resume_parser.add_argument("--run-id", help="Stopped Agent run identifier")
+    resume_parser.set_defaults(handler=resume_entry)
 
 
 # 复用历史回放、精确订阅和完成等待逻辑观察一次远程运行或恢复请求。
@@ -133,6 +134,22 @@ def run(config: ManiusConfig, goal: str) -> None:
 # 执行恢复任务命令并以完成事件状态映射进程退出码。
 def resume(config: ManiusConfig, run_id: str) -> None:
     _exit_for_finished_event(_resume_remote, config, run_id)
+
+
+# 根据参数恢复中断的独立运行，或进入指定持久会话的连续聊天模式。
+def resume_entry(config: ManiusConfig, run_id: str | None = None, session_id: str | None = None) -> None:
+    if run_id is not None and session_id is not None:
+        print("manius: choose either --run-id or a session_id", file=sys.stderr)
+        raise SystemExit(2)
+    if session_id is not None:
+        from manius_code.cli.commands.chat import chat
+
+        chat(config, session_id)
+        return
+    if run_id is None:
+        print("manius: resume requires --run-id or a session_id", file=sys.stderr)
+        raise SystemExit(2)
+    resume(config, run_id)
 
 
 # 统一输出 IPC 或数据校验错误，并将失败完成事件转换为非零退出码。

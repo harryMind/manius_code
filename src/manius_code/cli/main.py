@@ -1,7 +1,7 @@
 import argparse
 
 import manius_code
-from manius_code.cli.commands import ping, run, trace
+from manius_code.cli.commands import chat, ping, run, trace
 from manius_code.core.config import ConfigError, load_config
 
 
@@ -13,6 +13,7 @@ def _create_parser() -> argparse.ArgumentParser:
 
     ping.register(subparsers)
     run.register(subparsers)
+    chat.register(subparsers)
     trace.register(subparsers)
     return parser
 

@@ -11,11 +11,12 @@ from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
-from textual.widgets import Static
+from textual.css.query import NoMatches
+from textual.widgets import Input, Static
 from textual.worker import Worker
 
-from manius_code.core.bus.commands import EventSubscribeResult, EventUnsubscribeResult
-from manius_code.core.bus.events import AgentEvent, LlmTokenEvent, RunFinishedEvent
+from manius_code.core.bus.commands import EventSubscribeResult, EventUnsubscribeResult, SessionCreateResult, SessionGetResult, SessionSendResult
+from manius_code.core.bus.events import AgentEvent, LlmTokenEvent, NoteSavedEvent, RunFinishedEvent, SessionCreatedEvent, SessionMessageSentEvent
 from manius_code.core.config import ConfigError, ManiusConfig, load_config
 from manius_code.core.transport.socket_client import IpcError, SocketClient
 
@@ -144,6 +145,11 @@ class ManiusTui(App[None]):
         scrollbar-size-horizontal: 1;
     }
 
+    #message-input {
+        height: 3;
+        margin: 0 1 1 1;
+    }
+
     #banner { padding: 1 2 0 2; }
     Static.run-header { color: $text-muted; padding: 1 2 0 2; }
     Static.step-divider { color: $text-muted; padding: 0 2; }
@@ -161,11 +167,15 @@ class ManiusTui(App[None]):
         self._token_buffers: dict[str, str] = {}
         self._stream_blocks: dict[str, LlmStreamBlock] = {}
         self._tool_blocks: dict[tuple[str, int, str], ToolCallBlock] = {}
+        self._session_id: str | None = None
+        self._session_turn_count = 0
+        self._active_run_id: str | None = None
 
     # 组合状态栏和可滚动的组件化事件视图。
     def compose(self) -> ComposeResult:
         yield Static(id="header")
         yield VerticalScroll(id="log-view")
+        yield Input(placeholder="输入目标后按 Enter 发送", disabled=True, id="message-input")
 
     # 挂载 Logo、启动 token 批量刷新定时器和 socket Worker。
     def on_mount(self) -> None:
@@ -194,8 +204,32 @@ class ManiusTui(App[None]):
         header.append("maniuscode", style="bold")
         header.append(f"  {self._config.host}:{self._config.port}", style="dim")
         header.append(f"  {state}", style=color)
-        header.append("  global", style="dim")
+        if self._session_id is None:
+            header.append("  session: connecting", style="dim")
+        else:
+            header.append(f"  session: {self._session_id[:8]}  turns: {self._session_turn_count}", style="dim")
         self.query_one("#header", Static).update(header)
+
+    # 按当前连接状态启用或禁用会话输入框，并在可输入时恢复焦点。
+    def _set_input_enabled(self, enabled: bool) -> None:
+        try:
+            input_box = self.query_one("#message-input", Input)
+        except NoMatches:
+            return
+        input_box.disabled = not enabled
+        if enabled:
+            input_box.focus()
+
+    # 接收输入框提交事件并交由 Textual Worker 发送会话消息，避免阻塞界面事件循环。
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "message-input" or self._session_id is None:
+            return
+        content = event.value.strip()
+        if not content or self._active_run_id is not None:
+            return
+        event.input.value = ""
+        self._set_input_enabled(False)
+        self.run_worker(self._send_message(content), exclusive=False, name="session-send")
 
     # 循环连接 daemon、订阅全局事件并在断线后自动重试。
     async def socket_loop(self) -> None:
@@ -206,6 +240,7 @@ class ManiusTui(App[None]):
             event_loop_task: asyncio.Task[None] | None = None
             try:
                 await client.connect()
+                await self._ensure_session(client)
                 subscription_response = await client.send_command(
                     "event.subscribe",
                     {"type": "event.subscribe", "run_id": None, "topics": ["*"]},
@@ -213,6 +248,7 @@ class ManiusTui(App[None]):
                 subscription = EventSubscribeResult.model_validate(subscription_response.result)
                 sub_id = subscription.sub_id
                 self._update_header("connected")
+                self._set_input_enabled(self._active_run_id is None)
                 event_loop_task = client._event_loop_task
                 if event_loop_task is None:
                     raise RuntimeError("SocketClient did not start its event loop")
@@ -223,6 +259,7 @@ class ManiusTui(App[None]):
                 pass
             finally:
                 self._finish_all_streams()
+                self._set_input_enabled(False)
                 try:
                     if sub_id is not None and event_loop_task is not None and not event_loop_task.done():
                         with suppress(IpcError, OSError, RuntimeError, ValidationError):
@@ -239,6 +276,37 @@ class ManiusTui(App[None]):
             self._update_header("disconnected")
             await asyncio.sleep(_RETRY_DELAY_SECONDS)
 
+    # 创建默认会话或重新加载已有会话元数据，使断线重连后仍能延续同一轮对话。
+    async def _ensure_session(self, client: SocketClient) -> None:
+        if self._session_id is None:
+            response = await client.send_command("session.create", {"type": "session.create", "client_id": "tui"})
+            session = SessionCreateResult.model_validate(response.result).session
+        else:
+            response = await client.send_command("session.get", {"type": "session.get", "session_id": self._session_id})
+            session = SessionGetResult.model_validate(response.result).session
+        self._session_id = session.session_id
+        self._session_turn_count = session.turn_count
+
+    # 通过当前长连接发送会话消息，并在 RPC 失败时恢复输入能力并显示简短错误。
+    async def _send_message(self, content: str) -> None:
+        client = self._client
+        session_id = self._session_id
+        if client is None or session_id is None:
+            self._append(Static("not connected to daemon", classes="run-err"))
+            self._set_input_enabled(True)
+            return
+        try:
+            response = await client.send_command(
+                "session.send",
+                {"type": "session.send", "session_id": session_id, "content": content},
+            )
+            result = SessionSendResult.model_validate(response.result)
+            self._active_run_id = result.run_id
+            self._append(Static(f"── turn {self._session_turn_count + 1} ──", classes="step-divider"))
+        except (IpcError, OSError, RuntimeError, ValidationError) as error:
+            self._append(Static(f"unable to send message: {error}", classes="run-err"))
+            self._set_input_enabled(True)
+
     # 校验服务端事件后交由组件化渲染逻辑处理，非法事件直接忽略。
     async def handle_event(self, message: dict[str, Any]) -> None:
         try:
@@ -249,6 +317,20 @@ class ManiusTui(App[None]):
 
     # 按事件类型更新流式结果块、工具块或新增普通事件组件。
     def _handle_agent_event(self, event: AgentEvent) -> None:
+        if isinstance(event, SessionCreatedEvent):
+            if event.session_id == self._session_id:
+                self._update_header("connected")
+            return
+        if isinstance(event, SessionMessageSentEvent):
+            if event.session_id == self._session_id:
+                self._active_run_id = event.run_id
+            return
+        if isinstance(event, NoteSavedEvent):
+            if event.session_id == self._session_id:
+                self._append(Static(f"  [green]saved note {event.note_id}[/green]  [dim]{event.title}[/dim]", classes="log-line"))
+            return
+        if self._active_run_id is not None and event.run_id != self._active_run_id:
+            return
         if isinstance(event, LlmTokenEvent):
             self._token_buffers[event.run_id] = self._token_buffers.get(event.run_id, "") + event.token
             return
@@ -283,6 +365,11 @@ class ManiusTui(App[None]):
                 self._finish_tool(event.run_id, event.step, event.tool_name, event.duration_ms, event.error)
             case "run_finished":
                 self._append(self._run_finished_widget(event))
+                if event.run_id == self._active_run_id:
+                    self._active_run_id = None
+                    self._session_turn_count += 1
+                    self._update_header("connected")
+                    self._set_input_enabled(True)
 
     # 将同一任务当前缓冲的 token 追加到唯一的流式结果组件。
     def _flush_token_buffers(self) -> None:

@@ -38,6 +38,12 @@ class TraceConfig(BaseModel):
     backup_count: int = Field(default=5, ge=0)
 
 
+class SessionConfig(BaseModel):
+    directory: Path = Path("sessions")
+    thread_turn_limit: int = Field(default=6, ge=1, le=100)
+    notes_top_k: int = Field(default=5, ge=1, le=50)
+
+
 class ManiusConfig(BaseModel):
     # IPC服务基础
     host: str = Field(default="127.0.0.1")
@@ -49,6 +55,7 @@ class ManiusConfig(BaseModel):
     llm: LlmConfig = Field(default_factory=LlmConfig)
     tavily: TavilyConfig = Field(default_factory=TavilyConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
+    session: SessionConfig = Field(default_factory=SessionConfig)
     max_steps: int = Field(default=20, ge=1)
     execution_batch_size: int = Field(default=8, ge=1)
 
@@ -79,6 +86,7 @@ def _environment_values(values: dict[str, str]) -> dict[str, object]:
     llm_values: dict[str, str] = {}
     tavily_values: dict[str, str] = {}
     trace_values: dict[str, str] = {}
+    session_values: dict[str, str] = {}
     for key, value in values.items():
         uppercase_key = key.upper()
         if uppercase_key == "ANTHROPIC_API_KEY":
@@ -93,6 +101,8 @@ def _environment_values(values: dict[str, str]) -> dict[str, object]:
                 tavily_values[config_key.removeprefix("tavily_")] = value
             elif config_key.startswith("trace_"):
                 trace_values[config_key.removeprefix("trace_")] = value
+            elif config_key.startswith("session_"):
+                session_values[config_key.removeprefix("session_")] = value
             else:
                 mapped[config_key] = value
     if llm_values:
@@ -101,6 +111,8 @@ def _environment_values(values: dict[str, str]) -> dict[str, object]:
         mapped["tavily"] = tavily_values
     if trace_values:
         mapped["trace"] = trace_values
+    if session_values:
+        mapped["session"] = session_values
     return mapped
 
 
@@ -132,4 +144,10 @@ def load_config(cwd: Path | None = None, environ: dict[str, str] | None = None) 
         raise ConfigError(str(error)) from error
     workspace = config.workspace.expanduser()
     config.workspace = workspace.resolve() if workspace.is_absolute() else (working_directory / workspace).resolve()
+    session_directory = config.session.directory.expanduser()
+    config.session.directory = (
+        session_directory.resolve()
+        if session_directory.is_absolute()
+        else (working_directory / session_directory).resolve()
+    )
     return config

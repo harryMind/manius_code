@@ -43,6 +43,7 @@ class AgentRunner:
         tool_factory: Callable[[ManiusConfig], ToolCatalog] = default_tool_catalog,
         event_subscribers: list[Subscriber] | None = None,
         tracer: TracingProvider | None = None,
+        system_context: str = "",
     ) -> None:
         self._config = config
         self._runs_dir = runs_dir
@@ -50,6 +51,7 @@ class AgentRunner:
         self._tool_factory = tool_factory
         self._event_subscribers = event_subscribers or []
         self._tracer = tracer
+        self._system_context = system_context
 
     # 为新任务创建运行目录并执行五层自主规划闭环。
     async def run(self, goal: str, run_id: str | None = None) -> RunSummary:
@@ -93,6 +95,8 @@ class AgentRunner:
         context = ExecutionContext(run_id=run_id, goal=goal, step=previous_step)
         if plan is None:
             context.initialize()
+        if self._system_context:
+            context.messages.insert(0, {"role": "system", "content": self._system_context})
         tools = self._tool_factory(self._config)
         provider = self._make_provider(event_bus, tools)
         supervisor = AutonomousSupervisor(
@@ -205,4 +209,5 @@ class AgentRunner:
             AnthropicProvider(self._config.llm, event_bus, [], tracer=self._tracer),
             tools.argument_models(),
             workspace=self._config.workspace,
+            system_context=self._system_context,
         )

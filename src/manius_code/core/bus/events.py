@@ -114,6 +114,32 @@ class LlmResponseEvent(BaseEvent):
     tool_calls: list[dict[str, Any]]
 
 
+class SessionEventBase(BaseModel):
+    kind: Literal["event"] = "event"
+    type: str
+    session_id: str
+    run_id: str | None = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    step: int = 0
+
+
+class SessionCreatedEvent(SessionEventBase):
+    type: Literal["session_created"] = "session_created"
+    client_id: str | None = None
+
+
+class SessionMessageSentEvent(SessionEventBase):
+    type: Literal["session_message_sent"] = "session_message_sent"
+    run_id: str
+    content: str
+
+
+class NoteSavedEvent(SessionEventBase):
+    type: Literal["note_saved"] = "note_saved"
+    note_id: int
+    title: str
+
+
 AgentEvent = Annotated[
     RunStartedEvent
     | RunResumedEvent
@@ -129,7 +155,10 @@ AgentEvent = Annotated[
     | ToolCallFailedEvent
     | LlmRequestEvent
     | LlmTokenEvent
-    | LlmResponseEvent,
+    | LlmResponseEvent
+    | SessionCreatedEvent
+    | SessionMessageSentEvent
+    | NoteSavedEvent,
     Field(discriminator="type"),
 ]
 
@@ -155,6 +184,9 @@ Event = Annotated[
     | ToolCallFailedEvent
     | LlmRequestEvent
     | LlmTokenEvent
-    | LlmResponseEvent,
+    | LlmResponseEvent
+    | SessionCreatedEvent
+    | SessionMessageSentEvent
+    | NoteSavedEvent,
     Field(discriminator="type"),
 ]

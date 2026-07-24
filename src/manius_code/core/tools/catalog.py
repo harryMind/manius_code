@@ -35,3 +35,7 @@ class ToolCatalog:
     # 返回原生结构化输出生成动作 Schema 所需的参数模型映射。
     def argument_models(self) -> dict[str, type[BaseModel]]:
         return {name: tool.arguments_model for name, tool in self._tools.items()}
+
+    # 返回附加指定工具后的新目录，避免改变共享的默认工具集合。
+    def with_tool(self, tool: ExecutableTool) -> "ToolCatalog":
+        return ToolCatalog([*self._tools.values(), tool])

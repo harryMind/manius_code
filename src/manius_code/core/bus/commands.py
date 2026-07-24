@@ -1,6 +1,7 @@
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PingCommand(BaseModel):
@@ -35,8 +36,51 @@ class AgentResumeCommand(BaseModel):
     run_id: str = Field(pattern="^[A-Za-z0-9_-]+$")
 
 
+class SessionCreateCommand(BaseModel):
+    type: Literal["session.create"] = "session.create"
+    client_id: str | None = Field(default=None, max_length=256)
+
+
+class SessionSendCommand(BaseModel):
+    type: Literal["session.send"] = "session.send"
+    session_id: str = Field(pattern="^[A-Za-z0-9_-]+$")
+    content: str = Field(min_length=1)
+
+    # 拒绝仅由空白组成的会话输入，避免创建无法执行的后台运行。
+    @field_validator("content")
+    @classmethod
+    def _content_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+
+class SessionGetCommand(BaseModel):
+    type: Literal["session.get"] = "session.get"
+    session_id: str = Field(pattern="^[A-Za-z0-9_-]+$")
+
+
+class SessionListCommand(BaseModel):
+    type: Literal["session.list"] = "session.list"
+
+
+class SessionDestroyCommand(BaseModel):
+    type: Literal["session.destroy"] = "session.destroy"
+    session_id: str = Field(pattern="^[A-Za-z0-9_-]+$")
+
+
 Command = Annotated[
-    PingCommand | EventSubscribeCommand | EventUnsubscribeCommand | EventListCommand | AgentRunCommand | AgentResumeCommand,
+    PingCommand
+    | EventSubscribeCommand
+    | EventUnsubscribeCommand
+    | EventListCommand
+    | AgentRunCommand
+    | AgentResumeCommand
+    | SessionCreateCommand
+    | SessionSendCommand
+    | SessionGetCommand
+    | SessionListCommand
+    | SessionDestroyCommand,
     Field(discriminator="type"),
 ]
 
@@ -64,3 +108,42 @@ class EventListResult(BaseModel):
 
 class AgentRunResult(BaseModel):
     run_id: str
+
+
+class SessionMetaResult(BaseModel):
+    session_id: str
+    client_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    run_ids: list[str] = Field(default_factory=list)
+    turn_count: int = Field(default=0, ge=0)
+
+
+class SessionThreadEntryResult(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+    run_id: str | None = None
+    timestamp: datetime
+
+
+class SessionCreateResult(BaseModel):
+    session: SessionMetaResult
+
+
+class SessionSendResult(BaseModel):
+    session_id: str
+    run_id: str
+
+
+class SessionGetResult(BaseModel):
+    session: SessionMetaResult
+    thread: list[SessionThreadEntryResult] = Field(default_factory=list)
+
+
+class SessionListResult(BaseModel):
+    sessions: list[SessionMetaResult] = Field(default_factory=list)
+
+
+class SessionDestroyResult(BaseModel):
+    session_id: str
+    destroyed: bool

@@ -71,10 +71,12 @@ class StructuredAutonomyProvider:
         provider: LlmProvider,
         tool_argument_models: Mapping[str, type[BaseModel]],
         workspace: Path | None = None,
+        system_context: str = "",
     ) -> None:
         self._provider = provider
         self._tool_argument_models = tool_argument_models
         self._workspace = (workspace or Path.cwd()).expanduser().resolve()
+        self._system_context = system_context.strip()
         self._batch_actions_enabled = True
 
     # 请求模型仅返回符合 PlanProposal schema 的初始计划。
@@ -241,7 +243,7 @@ class StructuredAutonomyProvider:
                     ),
                 }
             ],
-            system_instruction=summary_instruction(),
+            system_instruction=self._with_system_context(summary_instruction()),
             emit_tokens=True,
         )
         return response.text.strip()
@@ -260,8 +262,12 @@ class StructuredAutonomyProvider:
             step,
             [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             response_model=model,
-            system_instruction=instruction,
+            system_instruction=self._with_system_context(instruction),
         )
+
+    # 在不改变原始目标字段的前提下向每次模型调用追加会话或调用方提供的背景。
+    def _with_system_context(self, instruction: str) -> str:
+        return instruction if not self._system_context else f"{instruction}\n\n{self._system_context}"
 
 
 class Planner:
