@@ -101,7 +101,10 @@ class AgentRunner:
             event_bus,
             run_dir,
             self._config.workspace,
-            AutonomyPolicy(max_steps=self._config.max_steps),
+            AutonomyPolicy(
+                max_steps=self._config.max_steps,
+                execution_batch_size=self._config.execution_batch_size,
+            ),
             tools,
         )
 

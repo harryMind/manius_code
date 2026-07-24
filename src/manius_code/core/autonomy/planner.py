@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import Mapping, Protocol, TypeVar
+from typing import Mapping, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
 from manius_code.core.autonomy.contracts import AuditResult, ActionProposal, PlanProposal, PlanStep, ResolverDecision, StepResult
-from manius_code.core.autonomy.structured_models import action_response_model
+from manius_code.core.autonomy.structured_models import action_response_model, batch_action_response_model
 from manius_code.core.llm.provider import LlmProvider
-from manius_code.core.prompt import action_instruction, plan_instruction, resolver_instruction, summary_instruction
+from manius_code.core.prompt import (
+    action_instruction,
+    batch_action_instruction,
+    plan_instruction,
+    resolver_instruction,
+    summary_instruction,
+)
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -43,6 +50,18 @@ class AutonomyProvider(Protocol):
 
     # 汇总所有已验证步骤并产出面向用户的最终结果。
     async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str: ...
+
+
+@runtime_checkable
+class BatchActionProvider(Protocol):
+    # 为当前滚动批次一次提出每个原子步骤恰好一个受限工具动作。
+    async def actions(
+        self,
+        run_id: str,
+        step: int,
+        plan_steps: list[PlanStep],
+        history: list[StepResult],
+    ) -> list[ActionProposal]: ...
 
 
 class StructuredAutonomyProvider:
@@ -116,6 +135,49 @@ class StructuredAutonomyProvider:
             action_response_model(plan_step.id, plan_step.allowed_tools, self._tool_argument_models),
         )
         return ActionProposal.model_construct(**response.action.model_dump(mode="json"))
+
+    # 使用原生结构化输出一次生成当前滚动批次每个步骤对应的受限动作。
+    async def actions(
+        self,
+        run_id: str,
+        step: int,
+        plan_steps: list[PlanStep],
+        history: list[StepResult],
+    ) -> list[ActionProposal]:
+        latest_audit_reports: list[dict[str, object]] = []
+        for plan_step in plan_steps:
+            audit_report = next(
+                (
+                    item.audit_report
+                    for item in reversed(history)
+                    if item.step_id == plan_step.id and item.audit_report is not None
+                ),
+                None,
+            )
+            if audit_report is None:
+                continue
+            latest_audit_reports.append(
+                {
+                    "step_id": plan_step.id,
+                    "violations": [violation.model_dump(mode="json") for violation in audit_report.violations],
+                    "rule_reminder": "Correct only this step's action using its allowed tool and workspace paths.",
+                }
+            )
+        payload: dict[str, object] = {
+            "plan_steps": [plan_step.model_dump(mode="json") for plan_step in plan_steps],
+            "workspace_root": str(self._workspace),
+            "recent_attempts": [item.model_dump(mode="json") for item in history[-6:] if item.audit_report is None],
+        }
+        if latest_audit_reports:
+            payload["latest_action_audit_reports"] = latest_audit_reports
+        response = await self._request(
+            run_id,
+            step,
+            batch_action_instruction(),
+            payload,
+            batch_action_response_model(plan_steps, self._tool_argument_models),
+        )
+        return [ActionProposal.model_construct(**action.model_dump(mode="json")) for action in response.actions]
 
     # 请求模型在失败后返回受限的 ResolverDecision。
     async def resolve(
@@ -208,3 +270,19 @@ class Planner:
         history: list[StepResult],
     ) -> ActionProposal:
         return await self._provider.action(run_id, step, plan_step, history)
+
+    # 优先调用支持原生批量动作的 Provider，旧 Provider 则并发复用单动作接口。
+    async def propose_actions(
+        self,
+        run_id: str,
+        step: int,
+        plan_steps: list[PlanStep],
+        history: list[StepResult],
+    ) -> list[ActionProposal]:
+        if isinstance(self._provider, BatchActionProvider):
+            return await self._provider.actions(run_id, step, plan_steps, history)
+        return list(
+            await asyncio.gather(
+                *(self.propose_action(run_id, step, plan_step, history) for plan_step in plan_steps)
+            )
+        )

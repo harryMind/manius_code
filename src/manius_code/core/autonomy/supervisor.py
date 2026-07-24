@@ -5,7 +5,7 @@ from pathlib import Path
 
 from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.autonomy.auditor import Auditor
-from manius_code.core.autonomy.contracts import AuditResult, Plan, PlanProposal, PlanStep, StepResult
+from manius_code.core.autonomy.contracts import ActionProposal, AuditResult, Plan, PlanProposal, PlanStep, StepResult
 from manius_code.core.autonomy.executor import Executor
 from manius_code.core.autonomy.planner import AutonomyProvider, Planner
 from manius_code.core.autonomy.policy import AutonomyPolicy
@@ -57,36 +57,27 @@ class AutonomousSupervisor:
         self._history = list(history or [])
         if plan is None:
             plan = await self._create_approved_plan(1)
-        while self._context.step < self._policy.max_steps:
-            ready_steps = self._scheduler.ready_steps(plan)
+        while True:
+            if self._scheduler.is_complete(plan):
+                await self._finish_success(plan)
+                return
+            if self._context.step >= self._policy.max_steps:
+                raise RuntimeError(f"Agent exceeded max_steps={self._policy.max_steps}")
             self._plans.save_state(plan)
-            if not ready_steps:
+            remaining_steps = self._policy.max_steps - self._context.step
+            batch = self._scheduler.ready_batch(
+                plan,
+                min(self._policy.execution_batch_size, remaining_steps),
+            )
+            if not batch:
                 if self._scheduler.is_complete(plan):
                     await self._finish_success(plan)
                     return
                 raise RuntimeError("plan has no executable step; unresolved dependencies remain")
-            remaining_steps = self._policy.max_steps - self._context.step
-            batch = ready_steps[:remaining_steps]
-            executions = await asyncio.gather(
-                *(self._execute_step(plan_step) for plan_step in batch),
-                return_exceptions=True,
-            )
-            for index, execution in enumerate(executions):
-                if isinstance(execution, BaseException):
-                    raise execution
-                plan_step, result, execution_step = execution
-                replacement = await self._finalize_step(plan, plan_step, result, execution_step)
-                if replacement is None:
-                    continue
-                for pending_execution in executions[index + 1 :]:
-                    if isinstance(pending_execution, BaseException):
-                        raise pending_execution
-                    _, pending_result, _ = pending_execution
-                    self._history.append(pending_result)
-                    self._plans.record_attempt(pending_result)
+            executions = await self._execute_batch(batch)
+            replacement = await self._finalize_batch(plan, executions)
+            if replacement is not None:
                 plan = replacement
-                break
-        raise RuntimeError(f"Agent exceeded max_steps={self._policy.max_steps}")
 
     # 使用最近一次计划审计报告重试生成完整计划，并在达到上限时以明确原因终止。
     async def _create_approved_plan(self, version: int, audit_report: AuditResult | None = None) -> Plan:
@@ -135,54 +126,88 @@ class AutonomousSupervisor:
         )
         return plan
 
-    # 并发请求单个步骤动作并执行工具，但不在此阶段修改全局计划版本。
-    async def _execute_step(self, plan_step: PlanStep) -> tuple[PlanStep, StepResult, int]:
-        self._context.step += 1
-        execution_step = self._context.step
-        plan_step.status = "running"
-        plan_step.attempt_count += 1
-        await self._event_bus.publish(
-            StepPlanningEvent(
-                run_id=self._context.run_id,
-                step=execution_step,
-                plan=f"{plan_step.title}: {plan_step.description}",
+    # 为当前就绪批次统一生成、审计并并发执行动作，同时保留步骤级结果隔离。
+    async def _execute_batch(self, plan_steps: list[PlanStep]) -> list[tuple[PlanStep, StepResult, int]]:
+        executions: list[tuple[PlanStep, int]] = []
+        for plan_step in plan_steps:
+            self._context.step += 1
+            execution_step = self._context.step
+            plan_step.status = "running"
+            plan_step.attempt_count += 1
+            executions.append((plan_step, execution_step))
+        await asyncio.gather(
+            *(
+                self._event_bus.publish(
+                    StepPlanningEvent(
+                        run_id=self._context.run_id,
+                        step=execution_step,
+                        plan=f"{plan_step.title}: {plan_step.description}",
+                    )
+                )
+                for plan_step, execution_step in executions
             )
         )
         try:
-            proposal = await self._planner.propose_action(
+            proposals = await self._planner.propose_actions(
                 self._context.run_id,
-                execution_step,
-                plan_step,
+                executions[0][1],
+                plan_steps,
                 self._history,
             )
-            audit_report = self._auditor.approve_action(plan_step, proposal)
-            if not audit_report.approved:
-                result = StepResult(
-                    step_id=plan_step.id,
-                    attempt=plan_step.attempt_count,
-                    tool_name=proposal.tool_name,
-                    error=audit_report.summary,
-                    audit_report=audit_report,
-                )
-            else:
-                result = await self._executor.execute(proposal, execution_step, plan_step.attempt_count)
         except RuntimeError as error:
-            result = StepResult(step_id=plan_step.id, attempt=plan_step.attempt_count, error=str(error))
-        return plan_step, result, execution_step
+            return [
+                (
+                    plan_step,
+                    StepResult(step_id=plan_step.id, attempt=plan_step.attempt_count, error=str(error)),
+                    execution_step,
+                )
+                for plan_step, execution_step in executions
+            ]
+        audit_reports = self._auditor.approve_actions(plan_steps, proposals)
+        proposals_by_step = {proposal.step_id: proposal for proposal in proposals}
+        results: dict[str, StepResult] = {}
+        approved_executions: list[tuple[ActionProposal, int, int]] = []
+        for (plan_step, execution_step), audit_report in zip(executions, audit_reports, strict=True):
+            proposal = proposals_by_step.get(plan_step.id)
+            if audit_report.approved and proposal is not None:
+                approved_executions.append((proposal, execution_step, plan_step.attempt_count))
+                continue
+            results[plan_step.id] = StepResult(
+                step_id=plan_step.id,
+                attempt=plan_step.attempt_count,
+                tool_name=proposal.tool_name if proposal is not None else None,
+                error=audit_report.summary,
+                audit_report=audit_report,
+            )
+        for result in await self._executor.execute_batch(approved_executions):
+            results[result.step_id] = result
+        return [
+            (plan_step, results[plan_step.id], execution_step)
+            for plan_step, execution_step in executions
+        ]
 
     # 按稳定批次顺序提交工具结果、验证状态及可能的修复或计划版本替换。
-    async def _finalize_step(
+    async def _finalize_batch(
         self,
         plan: Plan,
-        plan_step: PlanStep,
-        result: StepResult,
-        execution_step: int,
+        executions: list[tuple[PlanStep, StepResult, int]],
     ) -> Plan | None:
-        self._history.append(result)
-        self._plans.record_attempt(result)
-        if result.error is None:
+        for _, result, _ in executions:
+            self._history.append(result)
+            self._plans.record_attempt(result)
+        verifiable = [(plan_step, result) for plan_step, result, _ in executions if result.error is None]
+        verifications = self._verifier.verify_batch(verifiable)
+        verification_by_step = {
+            plan_step.id: verification
+            for (plan_step, _), verification in zip(verifiable, verifications, strict=True)
+        }
+        failures: list[tuple[PlanStep, StepResult, int]] = []
+        for index, (plan_step, result, execution_step) in enumerate(executions):
+            if result.error is not None:
+                failures.append((plan_step, result, execution_step))
+                continue
             plan_step.status = "verifying"
-            verification = self._verifier.verify(plan_step, result)
+            verification = verification_by_step[plan_step.id]
             if verification.passed:
                 plan_step.status = "succeeded"
                 observation = "; ".join(verification.evidence) or "acceptance criteria verified"
@@ -195,15 +220,16 @@ class AutonomousSupervisor:
                     )
                 )
                 await self._publish_step_done(observation, execution_step)
-                self._plans.save_state(plan)
-                return None
+                continue
             result.error = verification.reason or "verification failed"
-            self._history[-1] = result
+            self._history[-len(executions) + index] = result
             self._plans.record_attempt(result)
-        plan_step.last_error = result.error
-        replacement = await self._repair(plan, plan_step, result, execution_step)
-        if replacement is not None:
-            return replacement
+            failures.append((plan_step, result, execution_step))
+        for plan_step, result, execution_step in failures:
+            plan_step.last_error = result.error
+            replacement = await self._repair(plan, plan_step, result, execution_step)
+            if replacement is not None:
+                return replacement
         self._plans.save_state(plan)
         return None
 

@@ -4,7 +4,17 @@ from pathlib import Path
 
 from manius_code.core.agent.context import ExecutionContext
 from manius_code.core.agent.runner import AgentRunner
-from manius_code.core.autonomy.contracts import AuditResult, AcceptanceCriterion, ActionProposal, Plan, PlanProposal, PlanStep, ResolverDecision, StepResult
+from manius_code.core.autonomy.contracts import (
+    AuditResult,
+    AcceptanceCriterion,
+    ActionProposal,
+    Plan,
+    PlanProposal,
+    PlanStep,
+    ResolverDecision,
+    StepResult,
+    VerificationResult,
+)
 from manius_code.core.autonomy.policy import AutonomyPolicy
 from manius_code.core.autonomy.store import PlanStore
 from manius_code.core.autonomy.supervisor import AutonomousSupervisor
@@ -95,6 +105,69 @@ class ParallelProvider:
     # 汇总两个并行步骤的已验证观察结果。
     async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
         return "parallel plan completed"
+
+
+class RollingBatchProvider:
+    # 保存每次批量动作请求中的步骤标识，以验证调度器按上限滚动绑定已就绪步骤。
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+
+    # 提供三个相互独立且分别拥有独立验收条件的原子读取步骤。
+    async def plan(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        memories: list[str],
+        available_tools: list[str],
+        audit_report: AuditResult | None = None,
+    ) -> PlanProposal:
+        return PlanProposal(
+            goal=goal,
+            steps=[
+                PlanStep(
+                    id=step_id,
+                    title=step_id.title(),
+                    allowed_tools=["read_file"],
+                    acceptance_criteria=[AcceptanceCriterion(kind="tool_result_contains", expected=step_id)],
+                )
+                for step_id in ["first", "second", "third"]
+            ],
+        )
+
+    # 阻止批量能力可用时意外回退到逐步骤动作规划接口。
+    async def action(self, run_id: str, step: int, plan_step: PlanStep, history: list[StepResult]) -> ActionProposal:
+        raise AssertionError("rolling batch execution must use the batch action interface")
+
+    # 一次返回同一批每个原子步骤各自受限的读取动作。
+    async def actions(
+        self,
+        run_id: str,
+        step: int,
+        plan_steps: list[PlanStep],
+        history: list[StepResult],
+    ) -> list[ActionProposal]:
+        self.batches.append([plan_step.id for plan_step in plan_steps])
+        return [
+            ActionProposal(step_id=plan_step.id, tool_name="read_file", arguments={"path": "README.md"})
+            for plan_step in plan_steps
+        ]
+
+    # 独立读取步骤应直接通过验收，不应进入故障修复路径。
+    async def resolve(
+        self,
+        run_id: str,
+        step: int,
+        goal: str,
+        plan_step: PlanStep,
+        result: StepResult,
+        history: list[StepResult],
+    ) -> ResolverDecision:
+        raise AssertionError("rolling batch steps should not need repair")
+
+    # 返回所有批次完成后的稳定摘要以断言任务进入终态。
+    async def summarize(self, run_id: str, step: int, goal: str, plan: PlanProposal, history: list[StepResult]) -> str:
+        return "rolling batch completed"
 
 
 # 功能：验证 AgentRunner 会从 state.json 和不可变计划恢复中断步骤，并持续写入同一事件流。
@@ -204,3 +277,49 @@ def test_supervisor_executes_ready_steps_in_parallel(tmp_path: Path) -> None:
     assert maximum_in_flight == 2
     assert context.status == "success"
     assert context.step == 2
+
+
+# 功能：验证独立原子步骤会按滚动批次统一生成动作、审批并验收，而不是逐步骤走完整闭环。
+# 设计：以三步骤和每批两个步骤构造边界，记录 Provider、Auditor 与 Verifier 的批量调用大小来覆盖动态绑定语义。
+def test_supervisor_rolls_ready_steps_through_batched_approval_and_verification(tmp_path: Path) -> None:
+    # 在单一事件循环中运行真实工具与批量替身，以验证分批动作请求和独立验收可共同成立。
+    async def exercise() -> tuple[RollingBatchProvider, list[int], list[int], ExecutionContext]:
+        (tmp_path / "README.md").write_text("first second third", encoding="utf-8")
+        context = ExecutionContext(run_id="rolling-batch-run", goal="Read all sections")
+        provider = RollingBatchProvider()
+        supervisor = AutonomousSupervisor(
+            context,
+            provider,
+            EventBus(),
+            tmp_path / "run",
+            tmp_path,
+            AutonomyPolicy(max_steps=3, execution_batch_size=2),
+            default_tool_catalog(ManiusConfig(workspace=tmp_path)),
+        )
+        audit_batch_sizes: list[int] = []
+        verification_batch_sizes: list[int] = []
+        original_approve_actions = supervisor._auditor.approve_actions
+        original_verify_batch = supervisor._verifier.verify_batch
+
+        # 记录一次集中动作审计覆盖的原子步骤数，同时复用真实审计实现。
+        def approve_actions(steps: list[PlanStep], proposals: list[ActionProposal]) -> list[AuditResult]:
+            audit_batch_sizes.append(len(steps))
+            return original_approve_actions(steps, proposals)
+
+        # 记录一次集中验收覆盖的交付物数量，同时复用真实验收规则。
+        def verify_batch(verifications: list[tuple[PlanStep, StepResult]]) -> list[VerificationResult]:
+            verification_batch_sizes.append(len(verifications))
+            return original_verify_batch(verifications)
+
+        supervisor._auditor.approve_actions = approve_actions
+        supervisor._verifier.verify_batch = verify_batch
+        await supervisor.run()
+        return provider, audit_batch_sizes, verification_batch_sizes, context
+
+    provider, audit_batch_sizes, verification_batch_sizes, context = asyncio.run(exercise())
+
+    assert provider.batches == [["first", "second"], ["third"]]
+    assert audit_batch_sizes == [2, 1]
+    assert verification_batch_sizes == [2, 1]
+    assert context.status == "success"
+    assert context.step == 3

@@ -31,3 +31,7 @@ class Verifier:
                     return VerificationResult(passed=False, reason=f"file does not contain expected text: {criterion.path}")
                 evidence.append(f"file contains expected text: {criterion.path}")
         return VerificationResult(passed=True, evidence=evidence)
+
+    # 批量验证独立交付物，复用单步骤验收规则以保持结果语义一致。
+    def verify_batch(self, verifications: list[tuple[PlanStep, StepResult]]) -> list[VerificationResult]:
+        return [self.verify(step, result) for step, result in verifications]

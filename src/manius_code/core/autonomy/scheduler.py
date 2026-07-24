@@ -16,6 +16,10 @@ class Scheduler:
         self._promote_ready_steps(plan)
         return sorted((step for step in plan.steps if step.status == "ready"), key=lambda step: step.id)
 
+    # 从当前已就绪步骤中按上限动态绑定下一轮可执行批次。
+    def ready_batch(self, plan: Plan, limit: int) -> list[PlanStep]:
+        return self.ready_steps(plan)[:limit]
+
     # 将所有依赖均成功的待执行步骤提升为就绪状态。
     def _promote_ready_steps(self, plan: Plan) -> None:
         completed = {step.id for step in plan.steps if step.status == "succeeded"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 from manius_code.core.autonomy.contracts import ActionProposal, StepResult
@@ -63,3 +64,7 @@ class Executor:
             )
         )
         return StepResult(step_id=proposal.step_id, attempt=attempt, tool_name=proposal.tool_name, observation=result)
+
+    # 并发执行已通过审计的批次动作并保持每个步骤独立的工具事件与结果。
+    async def execute_batch(self, executions: list[tuple[ActionProposal, int, int]]) -> list[StepResult]:
+        return list(await asyncio.gather(*(self.execute(proposal, step, attempt) for proposal, step, attempt in executions)))

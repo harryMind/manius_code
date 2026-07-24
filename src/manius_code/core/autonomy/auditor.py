@@ -113,6 +113,33 @@ class Auditor:
                 )
         return self._result(violations)
 
+    # 按步骤标识批量审计动作，使单个违规不会阻塞同批其他独立步骤。
+    def approve_actions(self, steps: list[PlanStep], proposals: list[ActionProposal]) -> list[AuditResult]:
+        results: list[AuditResult] = []
+        for step in steps:
+            matching_proposals = [proposal for proposal in proposals if proposal.step_id == step.id]
+            if not matching_proposals:
+                results.append(
+                    self._result(
+                        [AuditViolation(code="missing_action", message=f"batch is missing an action for step {step.id}")]
+                    )
+                )
+                continue
+            if len(matching_proposals) > 1:
+                results.append(
+                    self._result(
+                        [
+                            AuditViolation(
+                                code="duplicate_action",
+                                message=f"batch contains multiple actions for step {step.id}",
+                            )
+                        ]
+                    )
+                )
+                continue
+            results.append(self.approve_action(step, matching_proposals[0]))
+        return results
+
     # 将违规列表规范为可持久化、可注入模型上下文的紧凑审计结果。
     def _result(self, violations: list[AuditViolation]) -> AuditResult:
         return AuditResult(

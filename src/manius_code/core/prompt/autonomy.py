@@ -31,6 +31,24 @@ def action_instruction() -> str:
     )
 
 
+# 返回用于一次为滚动批次中多个原子步骤生成受限动作的结构化提示词。
+def batch_action_instruction() -> str:
+    import os
+
+    shell_guidance = (
+        "The command tool executes in PowerShell: use PowerShell syntax such as New-Item -ItemType Directory -Force and semicolons; "
+        "do not use POSIX mkdir -p or ls."
+        if os.name == "nt"
+        else "The command tool executes in a POSIX shell: use POSIX shell syntax."
+    )
+    return (
+        "You are the Executor planner. The response structure is enforced by the API. Propose exactly one action for every "
+        "supplied plan_steps item, preserving its step_id. Each action's tool_name must be in that step's allowed_tools and all "
+        "paths must be workspace-relative. If latest_action_audit_reports is present, correct only the listed steps. "
+        + shell_guidance
+    )
+
+
 # 返回用于失败修复、步骤修订和重规划决策的结构化提示词。
 def resolver_instruction() -> str:
     return (

@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from manius_code.core.autonomy.contracts import AuditResult, AuditViolation, PlanProposal, PlanStep, StepResult
 from manius_code.core.autonomy.planner import StructuredAutonomyProvider
 from manius_code.core.config import ManiusConfig
-from manius_code.core.prompt import plan_instruction
+from manius_code.core.prompt import batch_action_instruction, plan_instruction
 from manius_code.core.tools.defaults import default_tool_catalog
 
 
@@ -192,6 +192,35 @@ def test_structured_autonomy_provider_uses_tool_specific_action_schema() -> None
     assert schema["$defs"]["StructuredAction_read_file"]["properties"]["arguments"] == {
         "$ref": "#/$defs/ReadFileArguments"
     }
+
+
+# 功能：验证支持批量能力的结构化 Provider 会在一次原生请求中返回当前滚动批次的全部原子动作。
+# 设计：为两个同工具步骤提供单个响应包络，并同时断言输入负载和动态 Schema 的步骤约束。
+def test_structured_autonomy_provider_uses_one_structured_request_for_a_rolling_batch() -> None:
+    llm = FakeLlmProvider(
+        json.dumps(
+            {
+                "actions": [
+                    {"step_id": "first", "tool_name": "read_file", "arguments": {"path": "README.md"}},
+                    {"step_id": "second", "tool_name": "read_file", "arguments": {"path": "README.md"}},
+                ]
+            }
+        )
+    )
+    provider = StructuredAutonomyProvider(llm, default_tool_catalog(ManiusConfig()).argument_models())
+    plan_steps = [
+        PlanStep(id="first", title="First", allowed_tools=["read_file"]),
+        PlanStep(id="second", title="Second", allowed_tools=["read_file"]),
+    ]
+
+    actions = asyncio.run(provider.actions("run-1", 1, plan_steps, []))
+    request = llm.requests[0]
+    payload = json.loads(request["messages"][0]["content"])
+
+    assert [action.step_id for action in actions] == ["first", "second"]
+    assert [step["id"] for step in payload["plan_steps"]] == ["first", "second"]
+    assert request["system_instruction"] == batch_action_instruction()
+    assert request["response_model"].model_fields["actions"].annotation
 
 
 # 功能：验证规划响应 Schema 将每步工具和验收列表声明为 API 可见的非空数组。

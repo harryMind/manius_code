@@ -50,6 +50,7 @@ class ManiusConfig(BaseModel):
     tavily: TavilyConfig = Field(default_factory=TavilyConfig)
     trace: TraceConfig = Field(default_factory=TraceConfig)
     max_steps: int = Field(default=20, ge=1)
+    execution_batch_size: int = Field(default=8, ge=1)
 
 
 _CONFIG_KEYS = set(ManiusConfig.model_fields)

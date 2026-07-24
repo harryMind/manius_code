@@ -52,3 +52,11 @@ def test_load_config_resolves_configured_workspace(tmp_path: Path) -> None:
     config = load_config(tmp_path, {"MANIUS_WORKSPACE": "../agent-output"})
 
     assert config.workspace == (tmp_path.parent / "agent-output").resolve()
+
+
+# 功能：验证滚动批量的执行上限可由环境变量配置并进入运行时策略。
+# 设计：只校验配置映射，避免在配置测试中引入 Agent、工具或异步调度依赖。
+def test_load_config_maps_execution_batch_size(tmp_path: Path) -> None:
+    config = load_config(tmp_path, {"MANIUS_EXECUTION_BATCH_SIZE": "3"})
+
+    assert config.execution_batch_size == 3
