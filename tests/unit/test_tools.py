@@ -9,7 +9,7 @@ import pytest
 
 from manius_code.core.events.bus import EventBus
 from manius_code.core.bus.events import AgentEvent
-from manius_code.core.tools.bash import BashTool, _shell_arguments
+from manius_code.core.tools.bash import BashTool, _decode_output, _shell_arguments
 from manius_code.core.tools.file_tools import ListDirTool, WriteFileTool
 from manius_code.core.tools.invocation import ToolExecutionError, ToolInvoker
 from manius_code.core.tools.read_file import ReadFileTool
@@ -89,6 +89,14 @@ def test_execution_tools_use_injected_workspace_and_native_shell(tmp_path: Path,
     else:
         assert shell[:2] == ("/bin/sh", "-lc")
         assert "POSIX shell" in bash_tool.definition["description"]
+
+
+# 功能：验证 Windows PowerShell 以本机代码页输出中文时，bash 工具不会把验收文本替换为乱码。
+# 设计：直接构造 GBK 字节而不依赖宿主 PowerShell 配置，精确覆盖 UTF-8 严格解码失败后的平台回退分支。
+def test_bash_decodes_windows_legacy_console_output() -> None:
+    if os.name != "nt":
+        return
+    assert _decode_output("余海林".encode("gbk")) == "余海林"
 
 
 # 功能：验证 write_file 的阻塞磁盘写入不会占用 asyncio 事件循环。

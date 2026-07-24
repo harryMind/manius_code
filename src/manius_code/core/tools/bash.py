@@ -31,6 +31,16 @@ def _shell_name() -> str:
     return "PowerShell" if os.name == "nt" else "POSIX shell"
 
 
+# 优先按 UTF-8 解码命令输出，并在 Windows PowerShell 返回本机 ANSI 字节时回退到 mbcs。
+def _decode_output(output: bytes) -> str:
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError:
+        if os.name == "nt":
+            return output.decode("mbcs", errors="replace")
+        return output.decode("utf-8", errors="replace")
+
+
 class BashArguments(BaseModel):
     command: str = Field(min_length=1)
 
@@ -83,7 +93,7 @@ class BashTool:
             await process.wait()
         except (OSError, RuntimeError) as error:
             raise ToolExecutionError(self.name, f"could not start command: {error}") from error
-        text = output.decode("utf-8", errors="replace")
+        text = _decode_output(bytes(output))
         if truncated:
             text += "\n[truncated: command output exceeds 64KB]"
         if process.returncode != 0:
